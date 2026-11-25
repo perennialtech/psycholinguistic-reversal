@@ -27,7 +27,7 @@ def main() -> None:
         choices=["classical", "nllb", "qwen", "best-of-n", "lora"],
         default="classical",
     )
-    p_rw.add_argument("--adapter-dir", default="checkpoints/qwen25-1.5b-psycho-rev-lora")
+    p_rw.add_argument("--adapter-dir", default="8q0sb/qwen25-1.5b-psycholinguistic-reversal-lora")
     p_rw.add_argument("--samples", type=int, default=6)
 
     p_bench = sub.add_parser("bench", help="Run the full multi-domain benchmark")

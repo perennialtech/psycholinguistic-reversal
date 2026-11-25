@@ -2,6 +2,8 @@
 
 Empirical study and runnable inference toolkit for **classically and neurally reversing** the six psycholinguistic difficulty features identified in [*Why is AI-generated language so hard to understand?* (Clark, Martin, & Mahowald, 2026; arXiv:2610.29162v1)](https://arxiv.org/abs/2610.29162).
 
+**Pretrained LoRA weights on Hugging Face:** [`8q0sb/qwen25-1.5b-psycholinguistic-reversal-lora`](https://huggingface.co/8q0sb/qwen25-1.5b-psycholinguistic-reversal-lora)
+
 ## Overview
 
 Modern post-trained LLMs overuse constructions that compress information density at the expense of human comprehension:
@@ -73,7 +75,7 @@ psycho-rev rewrite --method classical "Right now \`is_file()\` swallows that per
 psycho-rev rewrite --method nllb "..."
 psycho-rev rewrite --method qwen "..."
 psycho-rev rewrite --method best-of-n --samples 6 "..."
-psycho-rev rewrite --method lora --adapter-dir checkpoints/qwen25-1.5b-psycho-rev-lora "..."
+psycho-rev rewrite --method lora "..."  # loads 8q0sb/qwen25-1.5b-psycholinguistic-reversal-lora from Hugging Face
 ```
 
 ### Train LoRA adapter and run full benchmark
