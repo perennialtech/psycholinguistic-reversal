@@ -2,6 +2,8 @@
 
 Empirical study and runnable inference toolkit for **classically and neurally reversing** the six psycholinguistic difficulty features identified in [*Why is AI-generated language so hard to understand?* (Clark, Martin, & Mahowald, 2026; arXiv:2610.29162v1)](https://arxiv.org/abs/2610.29162).
 
+**Pretrained 3B QLoRA weights on Hugging Face:** [`8q0sb/qwen25-3b-psycholinguistic-reversal-lora`](https://huggingface.co/8q0sb/qwen25-3b-psycholinguistic-reversal-lora)
+
 ## Overview
 
 Modern post-trained LLMs overuse constructions that compress information density at the expense of human comprehension:
@@ -83,15 +85,15 @@ psycho-rev rewrite --method classical "Right now \`is_file()\` swallows that per
 # Neural and hybrid options (GPU recommended)
 psycho-rev rewrite --method best-of-n --samples 6 --file draft.md --plain
 psycho-rev rewrite --method hybrid-bon --file draft.md --plain
-psycho-rev rewrite --method lora --adapter-dir checkpoints/qwen25-3b-psycho-rev-lora "..."
-psycho-rev rewrite --method hybrid-lora --adapter-dir checkpoints/qwen25-3b-psycho-rev-lora "..."
+psycho-rev rewrite --method lora --adapter-dir 8q0sb/qwen25-3b-psycholinguistic-reversal-lora "..."
+psycho-rev rewrite --method hybrid-lora --adapter-dir 8q0sb/qwen25-3b-psycholinguistic-reversal-lora "..."
 ```
 
 ### Train QLoRA/LoRA (SFT + SimPO) and run full benchmark
 
 ```bash
 python -m psycho_rev.train_lora --resume --epochs 3 --dpo-epochs 2
-python -m psycho_rev.evaluate --adapter-dir checkpoints/qwen25-3b-psycho-rev-lora
+python -m psycho_rev.evaluate --adapter-dir 8q0sb/qwen25-3b-psycholinguistic-reversal-lora
 pytest -v
 ```
 
