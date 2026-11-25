@@ -23,9 +23,50 @@ from typing import Any
 import spacy
 from nltk.corpus import brown, reuters, wordnet as wn
 
-from psycho_rev.code_guard import protect_spans
+from psycho_rev.code_guard import protect_spans, strip_fenced_code_blocks
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "psycholinguistic-reversal"
+
+# Curated modern technical & workplace vocabulary to prevent OOV unigram penalties
+# against 1960s-1980s reference corpora (Brown/Reuters) without inflating collocations.
+MODERN_TECH_VOCAB: set[str] = {
+    "accessibility", "adjudication", "algorithmic", "analytics", "api", "apis",
+    "async", "authentication", "authorization", "automation", "autoscaling",
+    "backend", "backends", "backlog", "backlogs", "backtrack", "backtracking",
+    "bandwidth", "benchmark", "benchmarked", "benchmarking", "benchmarks",
+    "browser", "cache", "cached", "caches", "caching", "calibration", "canary",
+    "checksum", "churn", "cli", "codebase", "cohort", "cohorts", "compaction",
+    "concurrently", "config", "configs", "configuration", "configurations",
+    "container", "containerize", "containers", "cron", "cutover", "cyclic",
+    "daemon", "daemons", "dashboard", "dashboards", "dataset", "datasets",
+    "deduplication", "deliverable", "deliverables", "deploy", "deployed",
+    "deploying", "deployment", "deployments", "deploys", "deserialization",
+    "digitization", "docker", "dockerfile", "dockyard", "dotenv", "downtime",
+    "dropoff", "ecosystem", "ecosystems", "endianness", "endpoint", "endpoints",
+    "env", "eviction", "failover", "fallback", "frontend", "frontends", "funnel",
+    "fuzz", "gateway", "git", "github", "graphql", "grpc", "guardrail", "handoff",
+    "harness", "helm", "hotfix", "http", "https", "idempotent", "ingestion",
+    "interdisciplinary", "invalidation", "invariant", "invariants", "javascript",
+    "json", "kubernetes", "latency", "lawmakers", "linter", "linters", "linux",
+    "localhost", "malformed", "metadata", "metric", "metrics", "microservice",
+    "microservices", "middleware", "modernization", "monolith", "monorepo",
+    "mutex", "nginx", "nosql", "observability", "onboarding", "pagination",
+    "parser", "payload", "payloads", "pipeline", "pipelining", "pipelines",
+    "playbook", "plugin", "plugins", "policymakers", "polyfill", "posix",
+    "postgres", "postmortem", "proxies", "proxy", "python", "quantization",
+    "reconciliation", "redis", "refactor", "refactored", "refactoring", "regex",
+    "replica", "replicas", "repo", "repos", "retraining", "retrospective",
+    "ridership", "roadmap", "roadmaps", "rollback", "rollbacks", "rollout",
+    "rollouts", "runbook", "runtime", "rust", "sandbox", "sandboxed", "schema",
+    "schemas", "sdk", "serialization", "serverless", "sharding", "shim",
+    "signup", "signups", "snapshot", "snapshots", "sprint", "sql", "sqlite",
+    "stakeholder", "stakeholders", "standup", "startup", "startups", "streaming",
+    "submodule", "submodules", "sunsetted", "symlink", "telemetry", "terraform",
+    "throughput", "timeout", "timeouts", "timezone", "timezones", "tokenization",
+    "toml", "triage", "typescript", "unaligned", "uptime", "utf", "validator",
+    "warmup", "webhook", "webhooks", "workflow", "workflows", "worktree",
+    "worktrees", "yaml",
+}
 
 # Verbs that strongly prefer animate agents (selectional restriction violations with inanimate nsubj)
 ANIMATE_VERBS: set[str] = {
@@ -52,6 +93,59 @@ KNOWN_DENOMINAL_VERBS: set[str] = {
     "silo", "spearhead", "spotlight", "stonewall", "sunset", "surface",
     "table", "task", "template", "triage", "weaponize", "whiteboard",
     "workshop",
+}
+
+# Irregular or unlemmatized surface forms that map to KNOWN_DENOMINAL_VERBS
+DENOMINAL_SURFACE_TO_LEMMA: dict[str, str] = {
+    "sunsetted": "sunset",
+    "sunsetting": "sunset",
+    "workshopped": "workshop",
+    "workshopping": "workshop",
+    "funnelled": "funnel",
+    "funnelling": "funnel",
+    "bottlenecked": "bottleneck",
+    "bottlenecking": "bottleneck",
+    "sandboxed": "sandbox",
+    "sandboxing": "sandbox",
+    "signposted": "signpost",
+    "signposting": "signpost",
+    "spotlighted": "spotlight",
+    "spotlighting": "spotlight",
+    "scaffolded": "scaffold",
+    "scaffolding": "scaffold",
+    "footnoted": "footnote",
+    "footnoting": "footnote",
+    "calendared": "calendar",
+    "calendaring": "calendar",
+    "bucketed": "bucket",
+    "bucketing": "bucket",
+    "benchmarked": "benchmark",
+    "benchmarking": "benchmark",
+    "instrumented": "instrument",
+    "instrumenting": "instrument",
+    "pipelined": "pipeline",
+    "pipelining": "pipeline",
+    "siloed": "silo",
+    "siloing": "silo",
+    "eyeballed": "eyeball",
+    "eyeballing": "eyeball",
+    "architected": "architect",
+    "architecting": "architect",
+}
+
+# Inanimate head-like nouns that commonly terminate a matrix NP before a reduced ORC's
+# animate subject (used to guard against spaCy garden-path compound flattening).
+_ORC_MATRIX_HEAD_NOUNS: set[str] = {
+    "agreement", "algorithm", "backlog", "bottleneck", "budget", "cadence",
+    "checklist", "clause", "config", "configuration", "deficit", "document",
+    "engine", "flow", "format", "formula", "framework", "funnel", "guard",
+    "heuristic", "hierarchy", "initiative", "layer", "mechanism", "metric",
+    "middleware", "model", "network", "offset", "overhead", "pattern", "pipeline",
+    "plan", "platform", "policy", "process", "program", "project", "protocol",
+    "questionnaire", "rate", "regime", "requirement", "roadmap", "rollout",
+    "schedule", "schema", "script", "service", "shim", "standard", "step",
+    "strategy", "system", "table", "template", "threshold", "timeline", "update",
+    "value", "workflow",
 }
 
 # Frequent conventional verbs excluded from WordNet-based denominal heuristics
@@ -114,7 +208,7 @@ _WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
 
 
 class ReferenceNgramModel:
-    """Human-corpus bigram/trigram reference model built from NLTK Brown + Reuters."""
+    """Human-corpus bigram/trigram reference model built from NLTK Brown + Reuters (+ webtext) + modern tech vocab."""
 
     def __init__(self, unigrams: Counter[str], bigrams: Counter[tuple[str, str]], trigrams: Counter[tuple[str, str, str]], total_tokens: int):
         self.unigrams = unigrams
@@ -126,7 +220,7 @@ class ReferenceNgramModel:
     @classmethod
     def load_or_build(cls) -> "ReferenceNgramModel":
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_path = CACHE_DIR / "ngram_ref_v1.pkl"
+        cache_path = CACHE_DIR / "ngram_ref_v2.pkl"
         if cache_path.exists():
             with open(cache_path, "rb") as f:
                 data = pickle.load(f)
@@ -137,8 +231,21 @@ class ReferenceNgramModel:
         trigrams: Counter[tuple[str, str, str]] = Counter()
         total = 0
 
-        for corpus in (brown, reuters):
-            for sent in corpus.sents():
+        corpora: list[Any] = [brown, reuters]
+        try:
+            from nltk.corpus import webtext
+
+            _ = webtext.fileids()
+            corpora.append(webtext)
+        except (ImportError, LookupError):
+            pass
+
+        for corpus in corpora:
+            try:
+                sents = corpus.sents()
+            except LookupError:
+                continue
+            for sent in sents:
                 toks = ["<s>", "<s>"] + [w.lower() for w in sent if _WORD_RE.fullmatch(w.lower())] + ["</s>"]
                 if len(toks) <= 3:
                     continue
@@ -148,6 +255,16 @@ class ReferenceNgramModel:
                     bigrams[(w1, w2)] += 1
                     trigrams[(w0, w1, w2)] += 1
                     total += 1
+
+        # Seed modern technical unigrams with a modest floor so domain terms are not penalized as OOV
+        # while leaving bigram/trigram collocation statistics uninflated.
+        tech_floor = 50
+        for term in MODERN_TECH_VOCAB:
+            w = term.lower()
+            if unigrams[w] < tech_floor:
+                delta = tech_floor - unigrams[w]
+                unigrams[w] = tech_floor
+                total += delta
 
         payload = {
             "unigrams": unigrams,
@@ -161,8 +278,9 @@ class ReferenceNgramModel:
 
     def score_text(self, text: str) -> tuple[float, float]:
         """Return (unattested_bigram_rate, trigram_perplexity) for text."""
-        clean = protect_spans(text).masked
-        sents = re.split(r"[.!?;\n]+", clean)
+        prose_only = strip_fenced_code_blocks(text)
+        clean = protect_spans(prose_only).masked
+        sents = re.split(r"[.!?;:\n]+", clean)
         bigram_total = 0
         unattested = 0
         log_prob_sum = 0.0
@@ -249,10 +367,17 @@ def _is_inanimate_noun(token: spacy.tokens.Token) -> bool:
     return True
 
 
+def _normalized_denominal_lemma(token: spacy.tokens.Token) -> str:
+    low = token.text.lower()
+    if low in DENOMINAL_SURFACE_TO_LEMMA:
+        return DENOMINAL_SURFACE_TO_LEMMA[low]
+    return token.lemma_.lower()
+
+
 def _is_denominal_verb(token: spacy.tokens.Token) -> bool:
     if token.pos_ != "VERB":
         return False
-    lemma = token.lemma_.lower()
+    lemma = _normalized_denominal_lemma(token)
     if lemma in CORE_NON_DENOMINAL_VERBS or len(lemma) < 3:
         return False
     if lemma in KNOWN_DENOMINAL_VERBS:
@@ -305,38 +430,101 @@ def _detect_orcs(doc: spacy.tokens.Doc) -> tuple[list[str], list[str]]:
     return reduced, full
 
 
-def _detect_stacked_nouns(doc: spacy.tokens.Doc) -> list[str]:
-    """Detect maximal stacked noun compounds of length >= 3 (including hyphenated noun modifiers)."""
-    stacks: list[str] = []
+def _compound_np_head(token: spacy.tokens.Token) -> spacy.tokens.Token:
+    """Walk upward along `compound` arcs within NOUN/PROPN to find the NP head."""
+    cur = token
+    seen: set[int] = {cur.i}
+    while cur.dep_ == "compound" and cur.head != cur and cur.head.pos_ in {"NOUN", "PROPN"}:
+        if cur.head.i in seen:
+            break
+        cur = cur.head
+        seen.add(cur.i)
+    return cur
+
+
+def _split_garden_path_orc_chain(chain: list[spacy.tokens.Token]) -> list[list[spacy.tokens.Token]]:
+    """Split a spaCy-flattened compound chain when it merges a matrix NP with a reduced-ORC subject.
+
+    For example, in 'The carbon border adjustment mechanism trade ministers negotiated bites hardest',
+    en_core_web_sm attaches 'adjustment', 'mechanism', and 'trade' all as `compound` children of
+    'ministers' (`nsubj` of 'negotiated'). When the final head is an animate `nsubj` of a verb and
+    an earlier inanimate matrix head noun (e.g. 'mechanism') appears 1-2 tokens before it, split
+    the chain at that NP boundary.
+    """
+    if len(chain) < 3:
+        return [chain]
+
+    head = chain[-1]
+    is_verb_subj = head.dep_ in {"nsubj", "nsubjpass"} and head.head.pos_ == "VERB"
+    if not (is_verb_subj and not _is_inanimate_noun(head)):
+        return [chain]
+
+    # Look for an inanimate matrix head noun leaving 1-2 tokens on the right for the ORC subject NP
+    min_k = max(1, len(chain) - 3)
+    max_k = len(chain) - 2
+    for k in range(max_k, min_k - 1, -1):
+        cand = chain[k]
+        if _is_inanimate_noun(cand) and cand.lemma_.lower() in _ORC_MATRIX_HEAD_NOUNS:
+            return [chain[: k + 1], chain[k + 1 :]]
+
+    return [chain]
+
+
+def find_stacked_noun_spans(doc: spacy.tokens.Doc) -> list[tuple[int, int, str]]:
+    """Detect maximal stacked noun compounds of length >= 3 within a single NP subtree.
+
+    Returns a list of `(start_idx, end_idx_inclusive, span_text)` tuples.
+    Only chains adjacent NOUN/PROPN tokens (including hyphenated noun modifiers) that
+    share the same compound NP head, never crossing into a relative clause subject or
+    separate NP.
+    """
+    spans: list[tuple[int, int, str]] = []
     visited: set[int] = set()
+
     for tok in doc:
-        if tok.i in visited:
+        if tok.i in visited or tok.pos_ not in {"NOUN", "PROPN"}:
             continue
-        if tok.pos_ not in {"NOUN", "PROPN"}:
-            continue
+
+        np_head = _compound_np_head(tok)
         chain = [tok]
         cur = tok.i
+
         while cur + 1 < len(doc):
             nxt = doc[cur + 1]
-            if nxt.pos_ in {"NOUN", "PROPN"} and (
-                nxt.dep_ == "compound"
-                or chain[-1].dep_ == "compound"
-                or (nxt.head == chain[-1] or chain[-1].head == nxt)
-            ):
+            if nxt.pos_ in {"NOUN", "PROPN"} and _compound_np_head(nxt) == np_head:
+                # Never chain past the NP head itself into a following sibling/clause
+                if chain[-1] == np_head:
+                    break
                 chain.append(nxt)
                 cur += 1
-            elif nxt.text == "-" and cur + 2 < len(doc) and doc[cur + 2].pos_ in {"NOUN", "PROPN"}:
+            elif (
+                nxt.text == "-"
+                and cur + 2 < len(doc)
+                and doc[cur + 2].pos_ in {"NOUN", "PROPN"}
+                and _compound_np_head(doc[cur + 2]) == np_head
+                and chain[-1] != np_head
+            ):
                 chain.append(doc[cur + 2])
                 cur += 2
             else:
                 break
-        if len(chain) >= 3:
-            for c in chain:
-                visited.add(c.i)
-            span_text = doc[chain[0].i : chain[-1].i + 1].text
-            if "CODEITEM" not in span_text:
-                stacks.append(span_text)
-    return stacks
+
+        for sub_chain in _split_garden_path_orc_chain(chain):
+            if len(sub_chain) >= 3:
+                start_i = sub_chain[0].i
+                end_i = sub_chain[-1].i
+                span_text = doc[start_i : end_i + 1].text
+                if "CODEITEM" not in span_text:
+                    spans.append((start_i, end_i, span_text))
+        for c in chain:
+            visited.add(c.i)
+
+    return spans
+
+
+def _detect_stacked_nouns(doc: spacy.tokens.Doc) -> list[str]:
+    """Return span texts of maximal stacked noun compounds of length >= 3."""
+    return [span_text for _, _, span_text in find_stacked_noun_spans(doc)]
 
 
 class PsycholinguisticAnalyzer:
@@ -347,14 +535,15 @@ class PsycholinguisticAnalyzer:
         self.ngram = ReferenceNgramModel.load_or_build()
 
     def analyze(self, text: str) -> FeatureReport:
-        guarded = protect_spans(text)
+        prose_only = strip_fenced_code_blocks(text)
+        guarded = protect_spans(prose_only)
         doc = self.nlp(guarded.masked)
 
         words = [t for t in doc if not t.is_punct and not t.is_space]
         word_count = max(len(words), 1)
         sents = list(doc.sents)
 
-        unattested_rate, trigram_ppl = self.ngram.score_text(text)
+        unattested_rate, trigram_ppl = self.ngram.score_text(prose_only)
 
         dep_lengths: list[int] = []
         std_lengths: list[float] = []
