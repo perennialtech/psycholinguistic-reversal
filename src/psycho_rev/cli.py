@@ -54,7 +54,7 @@ def main() -> None:
     )
     p_rw.add_argument(
         "--adapter-dir",
-        default="checkpoints/qwen25-3b-psycho-rev-lora",
+        default="8q0sb/qwen25-3b-psycholinguistic-reversal-lora",
         help="LoRA adapter directory or Hugging Face repo ID",
     )
     p_rw.add_argument(
