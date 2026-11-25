@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psycholinguistic-reversal"
+version = "0.1.0"
+description = "Classical and neural reversal of psycholinguistic difficulty features in LLM-generated text (arXiv:2610.29162)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "spacy>=3.7",
+    "nltk>=3.8",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "torch>=2.2",
+    "transformers>=4.44",
+    "accelerate>=0.33",
+    "peft>=0.12",
+    "sentence-transformers>=3.0",
+    "matplotlib>=3.8",
+    "pandas>=2.1",
+    "tqdm>=4.66",
+]
+
+[project.scripts]
+psycho-rev = "psycho_rev.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

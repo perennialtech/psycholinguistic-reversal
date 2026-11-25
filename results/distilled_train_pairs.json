@@ -1,0 +1,352 @@
+[
+  {
+    "id": "train_00",
+    "source": "The retry policy configuration you deployed silently eats timeout exceptions and starves downstream queue workers.",
+    "target": "The retry policy you deployed quietly handles timeout exceptions and slows down the work being done by downstream queue workers.",
+    "orig_difficulty": 146.58,
+    "target_difficulty": 53.47,
+    "difficulty_drop": 93.11,
+    "cosine_similarity": 0.9084,
+    "nli_min_entailment": 0.9282
+  },
+  {
+    "id": "train_02",
+    "source": "This memory allocation strategy chokes on large payloads because the garbage collection pause window bites during peak traffic.",
+    "target": "This memory allocation strategy can't handle big data packets because the garbage collection pauses get really long during busy times.",
+    "orig_difficulty": 130.48,
+    "target_difficulty": 90.23,
+    "difficulty_drop": 40.25,
+    "cosine_similarity": 0.7946,
+    "nli_min_entailment": 0.9671
+  },
+  {
+    "id": "train_03",
+    "source": "Before we sunset `legacy/export.py`, we should scaffold a fallback endpoint and gate the traffic cutover.",
+    "target": "Before we turn off `legacy/export.py`, we should set up a backup endpoint and control the switch of the traffic flow.",
+    "orig_difficulty": 155.0,
+    "target_difficulty": 23.28,
+    "difficulty_drop": 131.72,
+    "cosine_similarity": 0.8579,
+    "nli_min_entailment": 0.9785
+  },
+  {
+    "id": "train_04",
+    "source": "The customer onboarding funnel marketing built refuses to convert mobile signups and quietly bleeds ad spend.",
+    "target": "The customer onboarding funnel marketing fails to turn mobile sign-ups into customers and wastes a lot of ad spending silently.",
+    "orig_difficulty": 70.12,
+    "target_difficulty": 61.8,
+    "difficulty_drop": 8.32,
+    "cosine_similarity": 0.8505,
+    "nli_min_entailment": 0.9972
+  },
+  {
+    "id": "train_06",
+    "source": "That authentication middleware change the contractor merged silently swallows invalid token errors in `auth/verify.py`.",
+    "target": "The change made by the authentication middleware that merged with the contractor silently swallowed invalid token errors in `auth/verify.py`.",
+    "orig_difficulty": 144.74,
+    "target_difficulty": 57.93,
+    "difficulty_drop": 86.81,
+    "cosine_similarity": 0.9736,
+    "nli_min_entailment": 0.9947
+  },
+  {
+    "id": "train_07",
+    "source": "The supply chain visibility platform logistics teams rely on bottlenecks customs clearance whenever invoice schemas drift.",
+    "target": "The supply chain visibility platform that logistics teams use has bottlenecks whenever customs clearance is affected when invoice schemas change.",
+    "orig_difficulty": 137.06,
+    "target_difficulty": 65.86,
+    "difficulty_drop": 71.2,
+    "cosine_similarity": 0.9368,
+    "nli_min_entailment": 0.9472
+  },
+  {
+    "id": "train_08",
+    "source": "Let us workshop the pricing tier matrix tomorrow and anchor the enterprise discount schedule on annual volume.",
+    "target": "Let's work on the pricing tier matrix tomorrow and make sure the enterprise discount schedule is based on annual volume.",
+    "orig_difficulty": 166.21,
+    "target_difficulty": 73.66,
+    "difficulty_drop": 92.55,
+    "cosine_similarity": 0.9058,
+    "nli_min_entailment": 0.9972
+  },
+  {
+    "id": "train_09",
+    "source": "The database index migration script you ran quietly punishes read replicas and demands twice the disk throughput.",
+    "target": "The script you ran to move the database index quietly affects the read replicas and requires twice the disk space for reading.",
+    "orig_difficulty": 128.31,
+    "target_difficulty": 49.42,
+    "difficulty_drop": 78.89,
+    "cosine_similarity": 0.8097,
+    "nli_min_entailment": 0.9946
+  },
+  {
+    "id": "train_10",
+    "source": "We should instrument `worker/dispatch.py` to spotlight stalled jobs and sandbox untrusted webhook callbacks.",
+    "target": "We should set up `worker/dispatch.py` to highlight stalled jobs and test untrusted webhook callbacks in a sandbox.",
+    "orig_difficulty": 129.42,
+    "target_difficulty": 31.52,
+    "difficulty_drop": 97.9,
+    "cosine_similarity": 0.9055,
+    "nli_min_entailment": 0.9942
+  },
+  {
+    "id": "train_11",
+    "source": "The quarterly planning cadence leadership introduced silos backend teams and sabotages cross-functional delivery velocity.",
+    "target": "The quarterly planning process that leadership introduced created silos among the backend teams and slowed down cross-functional delivery speed.",
+    "orig_difficulty": 109.78,
+    "target_difficulty": 38.11,
+    "difficulty_drop": 71.67,
+    "cosine_similarity": 0.8443,
+    "nli_min_entailment": 0.9904
+  },
+  {
+    "id": "train_12",
+    "source": "That cache eviction heuristic the patch introduced bites whenever session state snapshots exceed the memory ceiling.",
+    "target": "Whenever session state snapshots take up more memory than the limit, that cache eviction heuristic the patch introduced causes problems.",
+    "orig_difficulty": 70.0,
+    "target_difficulty": 62.06,
+    "difficulty_drop": 7.94,
+    "cosine_similarity": 0.8876,
+    "nli_min_entailment": 0.9818
+  },
+  {
+    "id": "train_13",
+    "source": "Before you shelve the search ranking experiment, eyeball the click-through rate lift and footnote the sample bias.",
+    "target": "Before you put away the search ranking experiment, look at how much more clicks there are that, and note any sample bias.",
+    "orig_difficulty": 146.72,
+    "target_difficulty": 28.97,
+    "difficulty_drop": 117.75,
+    "cosine_similarity": 0.8743,
+    "nli_min_entailment": 0.9968
+  },
+  {
+    "id": "train_14",
+    "source": "The API rate limit policy gateway servers enforce refuses to burst gracefully and starves legitimate batch clients.",
+    "target": "The rate limit policy on the gateway servers that the API uses refuses to handle bursts of requests gracefully and starves legitimate batch clients.",
+    "orig_difficulty": 67.15,
+    "target_difficulty": 51.86,
+    "difficulty_drop": 15.29,
+    "cosine_similarity": 0.9476,
+    "nli_min_entailment": 0.9792
+  },
+  {
+    "id": "train_15",
+    "source": "We can bridge the analytics warehouse schema and the billing ledger by pipelining daily reconciliation snapshots.",
+    "target": "We can connect the analytics warehouse's structure with the billing ledger by creating daily snapshots that we run through a pipeline.",
+    "orig_difficulty": 146.91,
+    "target_difficulty": 28.38,
+    "difficulty_drop": 118.53,
+    "cosine_similarity": 0.8725,
+    "nli_min_entailment": 0.56
+  },
+  {
+    "id": "train_16",
+    "source": "The compliance audit checklist legal circulated quietly eats engineering sprint capacity without reducing real exposure.",
+    "target": "The compliance audit checklist was quietly circulated and used to eat into engineering sprints without reducing real exposure.",
+    "orig_difficulty": 106.85,
+    "target_difficulty": 60.23,
+    "difficulty_drop": 46.62,
+    "cosine_similarity": 0.8058,
+    "nli_min_entailment": 0.8794
+  },
+  {
+    "id": "train_18",
+    "source": "Let us champion a simpler error reporting convention and sunset the legacy telemetry collector in `metrics/agent.py`.",
+    "target": "Let's champion a simpler way to report errors and end the use of the old telemetry collector in `metrics/agent.py`.",
+    "orig_difficulty": 139.58,
+    "target_difficulty": 53.26,
+    "difficulty_drop": 86.32,
+    "cosine_similarity": 0.9203,
+    "nli_min_entailment": 0.9981
+  },
+  {
+    "id": "train_19",
+    "source": "The regional power grid dispatch model utilities depend on struggles to balance rapid solar generation ramps.",
+    "target": "The regional power grid relies on utilities having trouble balancing sudden changes in solar energy production.",
+    "orig_difficulty": 69.23,
+    "target_difficulty": 28.37,
+    "difficulty_drop": 40.86,
+    "cosine_similarity": 0.7917,
+    "nli_min_entailment": 0.9911
+  },
+  {
+    "id": "train_21",
+    "source": "The telemetry ingestion pipeline you refactored mirrors production traffic accurately, though it still demands excessive RAM.",
+    "target": "The telemetry ingestion pipeline you refactored works well with production traffic, but it still needs too much RAM.",
+    "orig_difficulty": 166.41,
+    "target_difficulty": 80.87,
+    "difficulty_drop": 85.54,
+    "cosine_similarity": 0.8591,
+    "nli_min_entailment": 0.9971
+  },
+  {
+    "id": "train_22",
+    "source": "That concurrency bug the stress test surfaced silently betrays lock ordering invariants inside `sync/mutex.rs`.",
+    "target": "The concurrency bug that the stress test found without making a noise revealed problems with how locks were ordered in `sync/mutex.rs`.",
+    "orig_difficulty": 86.48,
+    "target_difficulty": 26.36,
+    "difficulty_drop": 60.12,
+    "cosine_similarity": 0.9519,
+    "nli_min_entailment": 0.9971
+  },
+  {
+    "id": "train_24",
+    "source": "The vendor security questionnaire procurement sent quietly punishes small startups with redundant certification demands.",
+    "target": "The vendor security questionnaire for procurement quietly punishes small startups by having them deal with too many unnecessary certification requirements.",
+    "orig_difficulty": 120.86,
+    "target_difficulty": 87.08,
+    "difficulty_drop": 33.78,
+    "cosine_similarity": 0.9387,
+    "nli_min_entailment": 0.9953
+  },
+  {
+    "id": "train_27",
+    "source": "That default timeout value the SDK ships silently swallows network partitions and tricks callers into endless retries.",
+    "target": "The SDK comes with a default timeout value that silently handles network partitions and makes callers keep retrying indefinitely.",
+    "orig_difficulty": 142.51,
+    "target_difficulty": 63.79,
+    "difficulty_drop": 78.72,
+    "cosine_similarity": 0.8993,
+    "nli_min_entailment": 0.9989
+  },
+  {
+    "id": "train_28",
+    "source": "Let us sandbox the browser extension update, bucket crash reports by OS version, and gate the stable release.",
+    "target": "Let's set up a sandbox for testing the browser extension update, collect crash reports by OS version, and hold off on releasing the stable version.",
+    "orig_difficulty": 161.39,
+    "target_difficulty": 52.77,
+    "difficulty_drop": 108.62,
+    "cosine_similarity": 0.8175,
+    "nli_min_entailment": 0.9628
+  },
+  {
+    "id": "train_29",
+    "source": "The freight corridor capacity plan port authorities drafted refuses to account for seasonal weather disruptions.",
+    "target": "The freight corridor's capacity plan that port authorities drafted doesn't take into account seasonal weather disruptions.",
+    "orig_difficulty": 62.66,
+    "target_difficulty": 29.02,
+    "difficulty_drop": 33.64,
+    "cosine_similarity": 0.8855,
+    "nli_min_entailment": 0.9839
+  },
+  {
+    "id": "train_30",
+    "source": "The schema validation hook `validate_row()` quietly eats malformed dates and sabotages downstream revenue forecasting.",
+    "target": "The schema validation hook `validate_row()` quietly chokes on malformed dates and ruins downstream revenue forecasts.",
+    "orig_difficulty": 88.7,
+    "target_difficulty": 83.58,
+    "difficulty_drop": 5.12,
+    "cosine_similarity": 0.9874,
+    "nli_min_entailment": 0.9973
+  },
+  {
+    "id": "train_31",
+    "source": "We need to scaffold a minimal test harness for `net/client.py` and surface connection reset counts in metrics.",
+    "target": "We need to create a simple test framework for `net/client.py` and show how many connection resets appear in our metric data.",
+    "orig_difficulty": 95.14,
+    "target_difficulty": 23.84,
+    "difficulty_drop": 71.3,
+    "cosine_similarity": 0.8356,
+    "nli_min_entailment": 0.9718
+  },
+  {
+    "id": "train_32",
+    "source": "The academic peer review bottleneck journals face bleeds early-career researcher momentum across every discipline.",
+    "target": "The academic peer review process for journals slows down early-career researchers in every field, which saps their momentum.",
+    "orig_difficulty": 150.9,
+    "target_difficulty": 57.81,
+    "difficulty_drop": 93.09,
+    "cosine_similarity": 0.897,
+    "nli_min_entailment": 0.9968
+  },
+  {
+    "id": "train_33",
+    "source": "That feature flag cleanup PR you opened accidentally breaks the fallback routing table edge proxies rely on.",
+    "target": "That PR you opened to clean up the feature flags accidentally breaks how the edge proxies rely on for their fallback routing table.",
+    "orig_difficulty": 127.12,
+    "target_difficulty": 31.34,
+    "difficulty_drop": 95.78,
+    "cosine_similarity": 0.9023,
+    "nli_min_entailment": 0.9944
+  },
+  {
+    "id": "train_34",
+    "source": "Let us calendar a design critique, workshop the navigation hierarchy, and spotlight the core checkout flow.",
+    "target": "Let's schedule a design critique, work on the navigation hierarchy, and focus on the main checkout flow.",
+    "orig_difficulty": 184.32,
+    "target_difficulty": 30.45,
+    "difficulty_drop": 153.87,
+    "cosine_similarity": 0.8592,
+    "nli_min_entailment": 0.9988
+  },
+  {
+    "id": "train_35",
+    "source": "The container image build cache layer we shared bottlenecks CI runners whenever base OS packages churn.",
+    "target": "The container image build cache layer we shared is a bottleneck for CI runners whenever base OS packages change.",
+    "orig_difficulty": 79.43,
+    "target_difficulty": 39.76,
+    "difficulty_drop": 39.67,
+    "cosine_similarity": 0.9627,
+    "nli_min_entailment": 0.9962
+  },
+  {
+    "id": "train_36",
+    "source": "The urban water conservation incentive program city planners launched bites hardest in older apartment complexes.",
+    "target": "The urban water conservation incentive program that city planners launched hits hardest in older apartment complexes.",
+    "orig_difficulty": 67.38,
+    "target_difficulty": 60.73,
+    "difficulty_drop": 6.65,
+    "cosine_similarity": 0.9298,
+    "nli_min_entailment": 0.993
+  },
+  {
+    "id": "train_38",
+    "source": "We should signpost deprecation dates clearly, sunset unused webhook versions, and bridge remaining clients smoothly.",
+    "target": "We should clearly mark the deprecation dates, sunset unused webhook versions, and make sure to smooth out the transition for remaining clients.",
+    "orig_difficulty": 89.24,
+    "target_difficulty": 33.8,
+    "difficulty_drop": 55.44,
+    "cosine_similarity": 0.8546,
+    "nli_min_entailment": 0.9974
+  },
+  {
+    "id": "train_39",
+    "source": "The healthcare claims adjudication engine insurers operate refuses to approve off-label treatments without manual appeal.",
+    "target": "The healthcare claims engine that insurers use won't approve off-label treatments unless there's a manual appeal process.",
+    "orig_difficulty": 69.37,
+    "target_difficulty": 40.97,
+    "difficulty_drop": 28.4,
+    "cosine_similarity": 0.861,
+    "nli_min_entailment": 0.995
+  },
+  {
+    "id": "train_40",
+    "source": "The model quantization calibration step you added silently betrays tail-latency guarantees on long context prompts.",
+    "target": "Adding the quantization calibration step in your model silently breaks the promise of not increasing tail latency for long context prompts.",
+    "orig_difficulty": 164.73,
+    "target_difficulty": 56.39,
+    "difficulty_drop": 108.34,
+    "cosine_similarity": 0.9406,
+    "nli_min_entailment": 0.969
+  },
+  {
+    "id": "train_41",
+    "source": "Let us instrument the checkout retry loop, eyeball the payment gateway error distribution, and triage failures.",
+    "target": "Let's add some instruments to the checkout retry loop, look at how payment gateway errors are spread out, and sort out the problems.",
+    "orig_difficulty": 181.61,
+    "target_difficulty": 71.44,
+    "difficulty_drop": 110.17,
+    "cosine_similarity": 0.855,
+    "nli_min_entailment": 0.9979
+  },
+  {
+    "id": "train_42",
+    "source": "The agricultural subsidy allocation formula lawmakers defended quietly punishes diversified small-scale family farms.",
+    "target": "Lawmakers quietly defended a formula for allocating agricultural subsidies that unfairly harms diversified small-scale family farms.",
+    "orig_difficulty": 107.4,
+    "target_difficulty": 59.64,
+    "difficulty_drop": 47.76,
+    "cosine_similarity": 0.8915,
+    "nli_min_entailment": 0.9938
+  }
+]
