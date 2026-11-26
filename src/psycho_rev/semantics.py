@@ -1,8 +1,9 @@
-"""Semantic fidelity, fluency (GPT-2 PPL), and code preservation metrics."""
+"""Semantic fidelity, fluency (LM PPL), grammatical acceptability (CoLA), and code preservation metrics."""
 
 from __future__ import annotations
 
 import gc
+import logging
 import math
 import re
 from dataclasses import asdict, dataclass
@@ -12,9 +13,22 @@ import numpy as np
 
 from psycho_rev.code_guard import code_preservation_rate, protect_spans
 
-_FENCED_CODE_RE = re.compile(r"```[\s\S]*?```", re.MULTILINE)
+logger = logging.getLogger(__name__)
+
+_FENCED_CODE_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~", re.MULTILINE)
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_MD_PREFIX_RE = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+|(?:[-*+]|\d+[.)])[ \t]+|>[ \t]*)")
+_ALPHA_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+
+DEFAULT_EVAL_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EVAL_NLI_MODEL = "cross-encoder/nli-deberta-v3-base"
+DEFAULT_EVAL_FLUENCY_MODEL = "gpt2"
+DEFAULT_HELDOUT_FLUENCY_MODEL = "gpt2-medium"
+DEFAULT_RERANK_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_RERANK_NLI_MODEL = "cross-encoder/nli-deberta-v3-small"
+DEFAULT_RERANK_FLUENCY_MODEL = "gpt2"
+DEFAULT_COLA_MODEL = "textattack/roberta-base-CoLA"
 
 
 def resolve_nli_label_indices(id2label: dict[Any, str] | None) -> tuple[int, int]:
@@ -44,6 +58,39 @@ def resolve_nli_label_indices(id2label: dict[Any, str] | None) -> tuple[int, int
     )
 
 
+def resolve_cola_label_index(id2label: dict[Any, str] | None) -> int:
+    """Resolve the index of the grammatically acceptable class from CoLA model id2label.
+
+    Standard CoLA checkpoints (including ``textattack/roberta-base-CoLA``) map
+    ``0 -> unacceptable`` and ``1 -> acceptable``. Falls back to ``1``.
+    """
+    if not id2label:
+        return 1
+
+    acceptable_idx: int | None = None
+    unacceptable_idx: int | None = None
+    indices: list[int] = []
+    for raw_idx, raw_label in id2label.items():
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        indices.append(idx)
+        label = str(raw_label).strip().lower()
+        if "unacceptable" in label or "incorrect" in label or "invalid" in label:
+            unacceptable_idx = idx
+        elif "acceptable" in label or "correct" in label or "valid" in label:
+            acceptable_idx = idx
+
+    if acceptable_idx is not None:
+        return acceptable_idx
+    if unacceptable_idx is not None and len(indices) == 2:
+        other = [i for i in indices if i != unacceptable_idx]
+        if other:
+            return other[0]
+    return 1
+
+
 def softmax_nli_probs(
     logits: np.ndarray | list[float],
     entail_idx: int = 1,
@@ -55,6 +102,20 @@ def softmax_nli_probs(
     exps = np.exp(shifted)
     probs = exps / np.sum(exps)
     return float(probs[entail_idx]), float(probs[contra_idx])
+
+
+def softmax_positive_prob(logits: np.ndarray | list[float], positive_idx: int = 1) -> float:
+    """Compute probability of ``positive_idx`` via numerically stable softmax."""
+    arr = np.asarray(logits, dtype=np.float64)
+    if arr.ndim == 0:
+        return float(1.0 / (1.0 + math.exp(-float(arr))))
+    if arr.size == 1:
+        return float(1.0 / (1.0 + math.exp(-float(arr.flat[0]))))
+    shifted = arr - np.max(arr)
+    exps = np.exp(shifted)
+    probs = exps / np.sum(exps)
+    idx = min(max(int(positive_idx), 0), len(probs) - 1)
+    return float(np.clip(probs[idx], 0.0, 1.0))
 
 
 def _split_long_paragraph(paragraph: str, target_words: int = 150) -> list[str]:
@@ -148,12 +209,205 @@ def align_text_chunks(
 
 
 def strip_fenced_code(text: str) -> str:
-    """Remove markdown fenced code blocks so code tokens do not skew prose perplexity."""
+    """Remove markdown fenced code blocks so code tokens do not skew prose metrics."""
     return _FENCED_CODE_RE.sub(" ", text).strip()
+
+
+def split_prose_sentences(text: str) -> list[str]:
+    """Extract clean prose sentences for sentence-level grammatical acceptability scoring.
+
+    Removes fenced code blocks, strips leading markdown list/heading/blockquote prefixes,
+    masks inline code spans and technical identifiers, and splits on sentence boundaries.
+    """
+    prose = strip_fenced_code(text)
+    if not prose:
+        return []
+
+    sentences: list[str] = []
+    for raw_line in prose.splitlines():
+        line = _MD_PREFIX_RE.sub("", raw_line).strip()
+        if not line:
+            continue
+        masked = protect_spans(line).masked
+        for part in _SENT_SPLIT_RE.split(masked):
+            sent = part.strip()
+            if not sent:
+                continue
+            tokens = _ALPHA_TOKEN_RE.findall(sent)
+            if len(tokens) >= 2:
+                sentences.append(sent)
+    return sentences
+
+
+class AcceptabilityScorer:
+    """Standalone lazy-loaded CoLA grammatical acceptability scorer.
+
+    Evaluates text sentence-by-sentence and returns both the mean and minimum
+    acceptability probability in ``[0.0, 1.0]`` so a single ungrammatical sentence
+    inside an otherwise fluent passage is surfaced rather than averaged away.
+
+    Can be imported independently by classical or neural rewriters as a lightweight
+    grammaticality gate via ``is_acceptable(...)`` or ``score_text(...)``.
+    """
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_COLA_MODEL,
+        device: str | None = None,
+        enabled: bool = True,
+        batch_size: int = 32,
+        max_length: int = 256,
+    ):
+        self.model_name = model_name
+        self.device = device
+        self.enabled = enabled
+        self.batch_size = max(1, int(batch_size))
+        self.max_length = max(16, int(max_length))
+        self._tokenizer: Any = None
+        self._model: Any = None
+        self._acceptable_idx: int = 1
+        self._load_failed: bool = False
+        self._load_error: str | None = None
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None and self._tokenizer is not None
+
+    @property
+    def load_error(self) -> str | None:
+        return self._load_error
+
+    def _ensure_loaded(self) -> bool:
+        if not self.enabled:
+            return False
+        if self._model is not None and self._tokenizer is not None:
+            return True
+        if self._load_failed:
+            return False
+
+        try:
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            resolved_device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = resolved_device
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self._model = AutoModelForSequenceClassification.from_pretrained(self.model_name).to(
+                resolved_device
+            )
+            self._model.eval()
+            id2label = getattr(getattr(self._model, "config", None), "id2label", None)
+            self._acceptable_idx = resolve_cola_label_index(id2label)
+            return True
+        except Exception as exc:
+            self._load_failed = True
+            self._load_error = str(exc)
+            logger.warning(
+                "CoLA acceptability model %r unavailable (%s); falling back to neutral 1.0.",
+                self.model_name,
+                exc,
+            )
+            return False
+
+    def score_sentences(self, sentences: list[str]) -> list[float]:
+        """Return acceptability probabilities in [0.0, 1.0] for each sentence."""
+        if not sentences:
+            return []
+        if not self._ensure_loaded():
+            return [1.0] * len(sentences)
+
+        import torch
+
+        scores: list[float] = []
+        for start in range(0, len(sentences), self.batch_size):
+            batch = sentences[start : start + self.batch_size]
+            enc = self._tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            if self.device is not None and hasattr(enc, "to"):
+                enc = enc.to(self.device)
+            elif self.device is not None and isinstance(enc, dict):
+                enc = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in enc.items()}
+
+            with torch.inference_mode():
+                outputs = self._model(**enc)
+                logits = outputs.logits
+
+            if hasattr(logits, "detach"):
+                logits = logits.detach()
+            if hasattr(logits, "cpu"):
+                logits = logits.cpu()
+            logits_arr = np.asarray(logits, dtype=np.float64)
+            if logits_arr.ndim == 1:
+                logits_arr = logits_arr[None, :]
+            for row in logits_arr:
+                scores.append(softmax_positive_prob(row, positive_idx=self._acceptable_idx))
+        return scores
+
+    def score_text(self, text: str) -> tuple[float, float]:
+        """Return ``(acceptability_mean, acceptability_min)`` for a single passage."""
+        return self.score_texts([text])[0]
+
+    def score_texts(self, texts: list[str]) -> list[tuple[float, float]]:
+        """Batch-score passages, returning ``(acceptability_mean, acceptability_min)`` per text."""
+        if not texts:
+            return []
+        if not self.enabled:
+            return [(1.0, 1.0)] * len(texts)
+
+        all_sentences: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for text in texts:
+            sents = split_prose_sentences(text)
+            start = len(all_sentences)
+            all_sentences.extend(sents)
+            spans.append((start, len(all_sentences)))
+
+        if not all_sentences:
+            return [(1.0, 1.0)] * len(texts)
+
+        flat_scores = self.score_sentences(all_sentences)
+        results: list[tuple[float, float]] = []
+        for start, end in spans:
+            if start == end:
+                results.append((1.0, 1.0))
+                continue
+            seg = flat_scores[start:end]
+            results.append((round(float(np.mean(seg)), 4), round(float(np.min(seg)), 4)))
+        return results
+
+    def is_acceptable(self, text: str, min_threshold: float = 0.5) -> bool:
+        """Return True when every sentence meets ``min_threshold`` grammatical acceptability."""
+        _, acc_min = self.score_text(text)
+        return acc_min >= min_threshold
+
+    def close(self) -> None:
+        """Release loaded CoLA model weights and free GPU memory."""
+        self._model = None
+        self._tokenizer = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
 
 @dataclass
 class SemanticReport:
+    """Semantic fidelity, fluency, code preservation, and grammatical acceptability metrics.
+
+    ``acceptability_score`` mirrors ``acceptability_min`` (worst-sentence CoLA grammatical
+    acceptability probability in ``[0.0, 1.0]``) so a single mangled sentence is never
+    hidden by averaging over surrounding fluent sentences.
+    """
+
     cosine_similarity: float
     nli_forward_entailment: float
     nli_backward_entailment: float
@@ -162,37 +416,69 @@ class SemanticReport:
     code_preservation: float
     length_ratio: float
     nli_max_contradiction: float = 0.0
+    acceptability_score: float = 1.0
+    acceptability_mean: float = 1.0
+    acceptability_min: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
 class SemanticEvaluator:
-    """Computes embedding cosine similarity, bidirectional NLI entailment, and GPT-2 fluency PPL."""
+    """Computes embedding cosine similarity, bidirectional NLI, LM fluency PPL, and CoLA acceptability.
+
+    Supports ``role="eval"`` (default held-out configuration using ``nli-deberta-v3-base``)
+    and ``role="rerank"`` (fast proxy configuration defaulting to ``nli-deberta-v3-small``)
+    so candidate reranking can be decoupled from held-out evaluation.
+    """
 
     def __init__(
         self,
-        embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        nli_model: str = "cross-encoder/nli-deberta-v3-base",
-        fluency_model: str = "gpt2",
+        embed_model: str = DEFAULT_EVAL_EMBED_MODEL,
+        nli_model: str = DEFAULT_EVAL_NLI_MODEL,
+        fluency_model: str = DEFAULT_EVAL_FLUENCY_MODEL,
         device: str | None = None,
+        *,
+        role: str = "eval",
+        enable_acceptability: bool = True,
+        acceptability_model: str = DEFAULT_COLA_MODEL,
+        lm_model: str | None = None,
     ):
+        if role not in {"eval", "rerank"}:
+            raise ValueError(f"Unsupported role {role!r}; expected 'eval' or 'rerank'.")
+
+        resolved_nli_model = nli_model
+        if role == "rerank" and nli_model == DEFAULT_EVAL_NLI_MODEL:
+            resolved_nli_model = DEFAULT_RERANK_NLI_MODEL
+        resolved_lm_model = lm_model if lm_model is not None else fluency_model
+
         import torch
         from sentence_transformers import CrossEncoder, SentenceTransformer
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        self.role = role
+        self.embed_model_name = embed_model
+        self.nli_model_name = resolved_nli_model
+        self.fluency_model_name = resolved_lm_model
+        self.enable_acceptability = enable_acceptability
+
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.embedder = SentenceTransformer(embed_model, device=self.device)
-        self.nli = CrossEncoder(nli_model, device=self.device)
+        self.nli = CrossEncoder(resolved_nli_model, device=self.device)
         id2label = getattr(
             getattr(getattr(self.nli, "model", None), "config", None),
             "id2label",
             None,
         )
         self._entail_idx, self._contra_idx = resolve_nli_label_indices(id2label)
-        self.lm_tok = AutoTokenizer.from_pretrained(fluency_model)
-        self.lm = AutoModelForCausalLM.from_pretrained(fluency_model).to(self.device)
+        self.lm_tok = AutoTokenizer.from_pretrained(resolved_lm_model)
+        self.lm = AutoModelForCausalLM.from_pretrained(resolved_lm_model).to(self.device)
         self.lm.eval()
+        self.acceptability_scorer: AcceptabilityScorer | None = AcceptabilityScorer(
+            model_name=acceptability_model,
+            device=self.device,
+            enabled=enable_acceptability,
+        )
 
     @staticmethod
     def _resolve_label_indices(id2label: dict[Any, str] | None) -> tuple[int, int]:
@@ -270,6 +556,12 @@ class SemanticEvaluator:
 
         all_logits = self.nli.predict(pairs, batch_size=32)
 
+        scorer = getattr(self, "acceptability_scorer", None)
+        if scorer is not None and getattr(self, "enable_acceptability", True):
+            acc_results = scorer.score_texts(rewrittens)
+        else:
+            acc_results = [(1.0, 1.0)] * len(rewrittens)
+
         reports: list[SemanticReport] = []
         for i, (o, r) in enumerate(zip(originals, rewrittens)):
             start, end = doc_spans[i]
@@ -288,6 +580,7 @@ class SemanticEvaluator:
             p_bwd = float(np.mean(bwd_entails)) if bwd_entails else 0.0
             max_contra = float(max(contras)) if contras else 0.0
             orig_words = max(len(o.split()), 1)
+            acc_mean, acc_min = acc_results[i]
 
             reports.append(
                 SemanticReport(
@@ -299,13 +592,19 @@ class SemanticEvaluator:
                     code_preservation=round(code_preservation_rate(o, r), 4),
                     length_ratio=round(len(r.split()) / orig_words, 3),
                     nli_max_contradiction=round(max_contra, 4),
+                    acceptability_score=acc_min,
+                    acceptability_mean=acc_mean,
+                    acceptability_min=acc_min,
                 )
             )
         return reports
 
     def close(self) -> None:
         """Release loaded models and free GPU memory."""
-        for attr in ("embedder", "nli", "lm", "lm_tok"):
+        scorer = getattr(self, "acceptability_scorer", None)
+        if scorer is not None:
+            scorer.close()
+        for attr in ("embedder", "nli", "lm", "lm_tok", "acceptability_scorer"):
             if hasattr(self, attr):
                 setattr(self, attr, None)
         gc.collect()
@@ -316,3 +615,32 @@ class SemanticEvaluator:
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+
+
+class HeldOutSemanticEvaluator(SemanticEvaluator):
+    """Independent held-out semantic evaluator decoupled from reranker proxy models.
+
+    Defaults to ``cross-encoder/nli-deberta-v3-base`` for bidirectional NLI,
+    ``textattack/roberta-base-CoLA`` for sentence-level grammatical acceptability,
+    and ``gpt2-medium`` (configurable via ``lm_model``) for fluency perplexity.
+    """
+
+    def __init__(
+        self,
+        embed_model: str = DEFAULT_EVAL_EMBED_MODEL,
+        nli_model: str = DEFAULT_EVAL_NLI_MODEL,
+        lm_model: str = DEFAULT_HELDOUT_FLUENCY_MODEL,
+        acceptability_model: str = DEFAULT_COLA_MODEL,
+        enable_acceptability: bool = True,
+        device: str | None = None,
+    ):
+        super().__init__(
+            embed_model=embed_model,
+            nli_model=nli_model,
+            fluency_model=lm_model,
+            device=device,
+            role="eval",
+            enable_acceptability=enable_acceptability,
+            acceptability_model=acceptability_model,
+            lm_model=lm_model,
+        )

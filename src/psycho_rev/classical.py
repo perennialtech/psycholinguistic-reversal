@@ -1,17 +1,23 @@
 """Classical (symbolic / spaCy dependency-tree + lexical frame) psycholinguistic reverser.
 
-Targets the six features from Clark, Martin, & Mahowald (2026) without neural generation:
+Targets the psycholinguistic difficulty features from Clark, Martin, & Mahowald (2026)
+without neural generation:
 1. Reduced object relative clauses -> insert overt 'that' relativizer
-2. Denominal verbs -> rewrite via curated light-verb + preposition frames
+2. Denominal verbs -> rewrite via curated context-gated light-verb + preposition frames
 3. Inanimate subjects with animate verbs -> replace figurative animate verb with literal verb
-4. Stacked noun compounds (3+ nouns) -> head-class prepositional unpacking
+4. Stacked noun compounds (3+ nouns) -> head-class prepositional unpacking (disabled in safe_mode)
 5. Long dependency clauses -> split long coordinated clauses on explicit conjunctions
+
+In `safe_mode=True` (default), brittle multi-noun `X for Y` inversion is disabled to avoid
+mangling complex noun phrases, and an optional sentence-level `fluency_gate` automatically
+reverts any edit that degrades grammatical acceptability.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Callable
 
 import spacy
 
@@ -203,25 +209,74 @@ class ClassicalRewriteResult:
 
 
 class ClassicalReverser:
-    """Deterministic spaCy + lexicon reverser for psycholinguistic difficulty features."""
+    """Deterministic spaCy + lexicon reverser for psycholinguistic difficulty features.
 
-    def __init__(self, spacy_model: str = "en_core_web_sm"):
+    Parameters
+    ----------
+    spacy_model:
+        Name of the spaCy pipeline to load (default ``"en_core_web_sm"``).
+    safe_mode:
+        When ``True`` (default), disables brittle multi-noun ``X for Y`` inversion
+        (``allow_noun_inversion=False``) and retains only high-precision edits
+        (reduced ORC ``that``-insertion, context-gated lexical replacements, and
+        explicit-subject clause splits). Set ``safe_mode=False`` for the full
+        legacy rule set.
+    allow_noun_inversion:
+        Optional explicit override for stacked-noun inversion. Defaults to
+        ``not safe_mode``.
+    fluency_gate:
+        Optional callable ``(sentence: str) -> float`` returning an acceptability
+        or fluency score (higher is better). When provided, any sentence whose
+        score drops by more than ``abs(min_fluency_delta)`` after classical edits
+        is automatically reverted to its original form.
+    min_fluency_delta:
+        Minimum permitted ``rewritten_score - original_score`` when
+        ``fluency_gate`` is active (default ``-0.05``).
+    """
+
+    def __init__(
+        self,
+        spacy_model: str = "en_core_web_sm",
+        safe_mode: bool = True,
+        allow_noun_inversion: bool | None = None,
+        fluency_gate: Callable[[str], float] | None = None,
+        min_fluency_delta: float = -0.05,
+    ):
         self.nlp = spacy.load(spacy_model)
+        self.safe_mode = safe_mode
+        self.allow_noun_inversion = (
+            (not safe_mode) if allow_noun_inversion is None else allow_noun_inversion
+        )
+        self.fluency_gate = fluency_gate
+        self.min_fluency_delta = min_fluency_delta
 
-    def _rewrite_segment(self, text: str, edits: dict[str, int]) -> str:
-        guarded = protect_spans(text)
-        doc = self.nlp(guarded.masked)
-
-        # Map token index -> replacement string (or prefix insertion)
+    def _rewrite_doc_span(
+        self,
+        doc: spacy.tokens.Doc,
+        start_i: int,
+        end_i: int,
+    ) -> tuple[str, dict[str, int]]:
+        """Apply classical rules to tokens doc[start_i:end_i] and return (reconstructed, local_edits)."""
+        local_edits = {
+            "orc_that_inserted": 0,
+            "denominal_expanded": 0,
+            "inanimate_verb_replaced": 0,
+            "noun_stack_unpacked": 0,
+            "clause_split": 0,
+        }
         replacements: dict[int, str] = {}
         insert_before: dict[int, str] = {}
         skip_indices: set[int] = set()
 
+        sent_slice = doc[start_i:end_i]
+
         # 1. Insert 'that' into reduced object relative clauses
-        for tok in doc:
+        for tok in sent_slice:
             if tok.dep_ != "relcl":
                 continue
             head = tok.head
+            if head.i < start_i or head.i >= end_i:
+                continue
             if head.pos_ not in {"NOUN", "PROPN", "PRON"}:
                 continue
             subjs = [c for c in tok.children if c.dep_ in {"nsubj", "nsubjpass"}]
@@ -234,18 +289,18 @@ class ClassicalReverser:
             span_end = max(head.i + 1, tok.i + 1)
             between = doc[span_start:span_end]
             has_rel = any(t.text.lower() in OVERT_RELATIVIZERS for t in between)
-            if not has_rel and head.i + 1 < len(doc):
+            if not has_rel and head.i + 1 < end_i:
                 insert_before[head.i + 1] = "that "
-                edits["orc_that_inserted"] += 1
+                local_edits["orc_that_inserted"] += 1
 
         # 2. Expand context-gated denominal verbs & 3. Replace animate verbs on inanimate subjects
-        for tok in doc:
+        for tok in sent_slice:
             if tok.pos_ != "VERB":
                 continue
             lemma = _normalized_denominal_lemma(tok)
             if _should_rewrite_denominal(tok, lemma):
                 replacements[tok.i] = _inflect_frame(tok, DENOMINAL_VERB_FRAMES[lemma])
-                edits["denominal_expanded"] += 1
+                local_edits["denominal_expanded"] += 1
                 continue
             raw_lemma = tok.lemma_.lower()
             if raw_lemma in ANIMATE_VERBS and raw_lemma in INANIMATE_VERB_FRAMES:
@@ -254,45 +309,53 @@ class ClassicalReverser:
                 )
                 if has_inanim_subj:
                     replacements[tok.i] = _inflect_frame(tok, INANIMATE_VERB_FRAMES[raw_lemma])
-                    edits["inanimate_verb_replaced"] += 1
+                    local_edits["inanimate_verb_replaced"] += 1
 
-        # 4. Unpack 3+ stacked noun compounds using shared detector from features.py
-        for span_start, span_end, span_text in find_stacked_noun_spans(doc):
-            if "CODEITEM" in span_text or any(i in replacements for i in range(span_start, span_end + 1)):
-                continue
-            unpacked = _unpack_stacked_noun(doc, span_start, span_end)
-            replacements[span_start] = unpacked
-            for idx in range(span_start + 1, span_end + 1):
-                skip_indices.add(idx)
+        # 4. Unpack 3+ stacked noun compounds (only when allow_noun_inversion=True)
+        if self.allow_noun_inversion:
+            for span_start, span_end, span_text in find_stacked_noun_spans(doc):
+                if span_start < start_i or span_end >= end_i:
+                    continue
+                if "CODEITEM" in span_text or any(
+                    i in replacements for i in range(span_start, span_end + 1)
+                ):
+                    continue
+                unpacked = _unpack_stacked_noun(doc, span_start, span_end)
+                replacements[span_start] = unpacked
+                for idx in range(span_start + 1, span_end + 1):
+                    skip_indices.add(idx)
 
-            # Fix indefinite article agreement ('a' vs 'an') immediately preceding the unpacked span
-            if span_start > 0 and (span_start - 1) not in replacements and (span_start - 1) not in skip_indices:
-                prev_tok = doc[span_start - 1]
-                prev_low = prev_tok.text.lower()
-                starts_vowel = bool(_VOWEL_START_RE.match(unpacked))
-                if prev_low == "an" and not starts_vowel:
-                    replacements[prev_tok.i] = "A" if prev_tok.text[0].isupper() else "a"
-                elif prev_low == "a" and starts_vowel:
-                    replacements[prev_tok.i] = "An" if prev_tok.text[0].isupper() else "an"
+                # Fix indefinite article agreement ('a' vs 'an') immediately preceding the unpacked span
+                if (
+                    span_start > start_i
+                    and (span_start - 1) not in replacements
+                    and (span_start - 1) not in skip_indices
+                ):
+                    prev_tok = doc[span_start - 1]
+                    prev_low = prev_tok.text.lower()
+                    starts_vowel = bool(_VOWEL_START_RE.match(unpacked))
+                    if prev_low == "an" and not starts_vowel:
+                        replacements[prev_tok.i] = "A" if prev_tok.text[0].isupper() else "a"
+                    elif prev_low == "a" and starts_vowel:
+                        replacements[prev_tok.i] = "An" if prev_tok.text[0].isupper() else "an"
 
-            edits["noun_stack_unpacked"] += 1
+                local_edits["noun_stack_unpacked"] += 1
 
         # 5. Split overly long sentences (>26 words) at high-level clause conjunctions
-        for sent in doc.sents:
-            sent_words = [t for t in sent if not t.is_punct and not t.is_space]
-            if len(sent_words) <= 26:
-                continue
-            for tok in sent:
+        sent_words = [t for t in sent_slice if not t.is_punct and not t.is_space]
+        if len(sent_words) > 26:
+            for tok in sent_slice:
                 if (
                     tok.dep_ == "cc"
                     and tok.text.lower() in {"and", "but"}
-                    and tok.i > sent.start + 8
-                    and tok.i < sent.end - 6
+                    and tok.i > start_i + 8
+                    and tok.i < end_i - 6
                 ):
                     prev_tok = doc[tok.i - 1]
                     conj_verb = tok.head
                     has_conj_subj = any(
-                        c.dep_ == "conj" and any(gc.dep_ in {"nsubj", "nsubjpass"} for gc in c.children)
+                        c.dep_ == "conj"
+                        and any(gc.dep_ in {"nsubj", "nsubjpass"} for gc in c.children)
                         for c in conj_verb.children
                     )
                     if prev_tok.text == "," and has_conj_subj and prev_tok.i not in skip_indices:
@@ -301,28 +364,58 @@ class ClassicalReverser:
                         nxt = doc[tok.i + 1]
                         if nxt.i not in replacements and nxt.i not in skip_indices and nxt.text:
                             replacements[nxt.i] = nxt.text[0].upper() + nxt.text[1:]
-                        edits["clause_split"] += 1
+                        local_edits["clause_split"] += 1
                         break
 
-        # Reconstruct text preserving original whitespace
+        # Reconstruct span preserving original whitespace
         out_parts: list[str] = []
-        for tok in doc:
+        for tok in sent_slice:
             if tok.i in skip_indices:
                 continue
             prefix = insert_before.get(tok.i, "")
             body = replacements.get(tok.i, tok.text)
-            ws = tok.whitespace_
+            ws = tok.whitespace_ if tok.i < end_i - 1 else ""
             if tok.i in replacements and tok.i + 1 in skip_indices:
                 last = tok.i
-                while last + 1 in skip_indices:
+                while last + 1 in skip_indices and last + 1 < end_i:
                     last += 1
-                ws = doc[last].whitespace_
+                ws = doc[last].whitespace_ if last < end_i - 1 else ""
             out_parts.append(prefix + body + ws)
 
         reconstructed = "".join(out_parts)
         reconstructed = re.sub(r"\s+([.,;:!?])", r"\1", reconstructed)
         reconstructed = re.sub(r" {2,}", " ", reconstructed).strip()
-        return guarded.restore(reconstructed)
+        return reconstructed, local_edits
+
+    def _rewrite_segment(self, text: str, edits: dict[str, int]) -> str:
+        guarded = protect_spans(text)
+        doc = self.nlp(guarded.masked)
+        sents = list(doc.sents)
+        if not sents:
+            return text
+
+        out_parts: list[str] = []
+        for idx, sent in enumerate(sents):
+            orig_sent_masked = sent.text
+            orig_sent_restored = guarded.restore(orig_sent_masked)
+            rew_sent_masked, local_edits = self._rewrite_doc_span(doc, sent.start, sent.end)
+            rew_sent_restored = guarded.restore(rew_sent_masked)
+
+            if self.fluency_gate is not None and rew_sent_restored != orig_sent_restored:
+                orig_score = float(self.fluency_gate(orig_sent_restored))
+                rew_score = float(self.fluency_gate(rew_sent_restored))
+                if (rew_score - orig_score) < self.min_fluency_delta:
+                    rew_sent_restored = orig_sent_restored
+                    edits["fluency_reverted"] += 1
+                    local_edits = {}
+
+            for key, count in local_edits.items():
+                edits[key] += count
+
+            trailing_ws = doc[sent.end - 1].whitespace_ if idx < len(sents) - 1 else ""
+            out_parts.append(rew_sent_restored + trailing_ws)
+
+        return "".join(out_parts)
 
     def rewrite_with_stats(self, text: str) -> ClassicalRewriteResult:
         edits = {
@@ -331,6 +424,7 @@ class ClassicalReverser:
             "inanimate_verb_replaced": 0,
             "noun_stack_unpacked": 0,
             "clause_split": 0,
+            "fluency_reverted": 0,
         }
         rewritten = rewrite_markdown_preserving_structure(
             text,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "psycholinguistic-reversal"
-version = "0.1.0"
+version = "0.2.0"
 description = "Classical and neural reversal of psycholinguistic difficulty features in LLM-generated text (arXiv:2610.29162)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,12 @@ dependencies = [
     "nltk>=3.8",
     "numpy>=1.26",
     "scipy>=1.11",
+    "httpx>=0.27",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+ml = [
     "torch>=2.2",
     "transformers>=4.44",
     "accelerate>=0.33",
@@ -20,7 +26,19 @@ dependencies = [
     "sentence-transformers>=3.0",
     "matplotlib>=3.8",
     "pandas>=2.1",
-    "tqdm>=4.66",
+]
+dev = [
+    "pytest>=8.0",
+]
+all = [
+    "torch>=2.2",
+    "transformers>=4.44",
+    "accelerate>=0.33",
+    "peft>=0.12",
+    "sentence-transformers>=3.0",
+    "matplotlib>=3.8",
+    "pandas>=2.1",
+    "pytest>=8.0",
 ]
 
 [project.scripts]

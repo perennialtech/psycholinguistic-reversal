@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import matplotlib
 
@@ -24,15 +25,88 @@ from psycho_rev.benchmark_data import (
 )
 from psycho_rev.classical import ClassicalReverser
 from psycho_rev.features import PsycholinguisticAnalyzer
+from psycho_rev.judge import BlindPairwiseJudge
 from psycho_rev.neural import (
     BestOfNPsycholinguisticReverser,
     LoRASinglePassReverser,
     NLLBRoundTripReverser,
     QwenZeroShotReverser,
 )
-from psycho_rev.semantics import SemanticEvaluator
+from psycho_rev.semantics import (
+    DEFAULT_EVAL_NLI_MODEL,
+    DEFAULT_HELDOUT_FLUENCY_MODEL,
+    HeldOutSemanticEvaluator,
+    SemanticEvaluator,
+)
 
 DOMAINS: tuple[str, ...] = ("chat", "coding", "essay")
+
+
+@dataclass(frozen=True)
+class EvalSample:
+    """Unified evaluation sample supporting legacy splits and external JSONL datasets."""
+
+    sample_id: str
+    domain: str
+    text: str
+    is_out_of_lexicon: bool | None = None
+
+
+def load_jsonl_dataset(path: Path) -> tuple[list[EvalSample], list[EvalSample]]:
+    """Load an external JSONL dataset into ``(test_samples, human_control_samples)``.
+
+    Supports ``text`` (or ``original``/``passage``/``input``), ``sample_id`` (or ``id``),
+    ``domain`` (or ``source``/``category``), ``is_out_of_lexicon`` (or ``out_of_lexicon``),
+    and optional ``is_human_control`` / ``domain == "human_control"`` separation.
+    """
+    dataset_path = Path(path)
+    test_samples: list[EvalSample] = []
+    control_samples: list[EvalSample] = []
+
+    with open(dataset_path, encoding="utf-8") as fh:
+        for idx, raw_line in enumerate(fh, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if not isinstance(rec, dict):
+                raise ValueError(f"Line {idx} in {dataset_path} is not a JSON object.")
+
+            text = (
+                rec.get("text")
+                or rec.get("original")
+                or rec.get("passage")
+                or rec.get("input")
+                or ""
+            )
+            if not isinstance(text, str) or not text.strip():
+                continue
+
+            sample_id = str(rec.get("sample_id") or rec.get("id") or f"ext_{idx:04d}")
+            domain = str(rec.get("domain") or rec.get("source") or rec.get("category") or "external")
+
+            raw_ool = rec.get("is_out_of_lexicon")
+            if raw_ool is None and "out_of_lexicon" in rec:
+                raw_ool = rec["out_of_lexicon"]
+            is_ool = bool(raw_ool) if raw_ool is not None else None
+
+            is_control = (
+                domain.lower() == "human_control"
+                or bool(rec.get("is_human_control", False))
+                or str(rec.get("split", "")).lower() == "human_control"
+            )
+            sample = EvalSample(
+                sample_id=sample_id,
+                domain="human_control" if is_control else domain,
+                text=text.strip(),
+                is_out_of_lexicon=is_ool,
+            )
+            if is_control:
+                control_samples.append(sample)
+            else:
+                test_samples.append(sample)
+
+    return test_samples, control_samples
 
 
 def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -49,6 +123,9 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, float]:
         "nli_min_entailment",
         "nli_max_contradiction",
         "gpt2_perplexity",
+        "acceptability_score",
+        "acceptability_mean",
+        "acceptability_min",
         "code_preservation",
         "length_ratio",
         "latency_ms",
@@ -62,16 +139,35 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 def _summarize_by_domain(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
     out: dict[str, dict[str, float]] = {}
-    for dom in DOMAINS:
+    seen_domains: list[str] = list(DOMAINS)
+    for r in rows:
+        dom = r.get("domain")
+        if isinstance(dom, str) and dom and dom != "human_control" and dom not in seen_domains:
+            seen_domains.append(dom)
+    for dom in seen_domains:
         dom_rows = [r for r in rows if r.get("domain") == dom]
         if dom_rows:
             out[dom] = _summarize_rows(dom_rows)
     return out
 
 
+def _summarize_out_of_lexicon(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Break down summary metrics into out_of_lexicon vs in_lexicon buckets when flags exist."""
+    ool_rows = [r for r in rows if r.get("is_out_of_lexicon") is True]
+    in_rows = [r for r in rows if r.get("is_out_of_lexicon") is False]
+    if not ool_rows and not in_rows:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    if ool_rows:
+        out["out_of_lexicon"] = {"count": len(ool_rows), **_summarize_rows(ool_rows)}
+    if in_rows:
+        out["in_lexicon"] = {"count": len(in_rows), **_summarize_rows(in_rows)}
+    return out
+
+
 def _evaluate_method(
     name: str,
-    samples: list[BenchmarkSample],
+    samples: Sequence[BenchmarkSample | EvalSample],
     rewriter_fn: Callable[[str], str],
     analyzer: PsycholinguisticAnalyzer,
     semantics: SemanticEvaluator,
@@ -97,19 +193,24 @@ def _evaluate_method(
         feat = analyzer.analyze(rew)
         sem_dict = sem.to_dict()
         sem_dict.setdefault("nli_max_contradiction", 0.0)
-        rows.append(
-            {
-                "method": name,
-                "split": split,
-                "sample_id": sample.sample_id,
-                "domain": sample.domain,
-                "original": sample.text,
-                "rewritten": rew,
-                "latency_ms": lat,
-                **feat.to_dict(),
-                **sem_dict,
-            }
-        )
+        sem_dict.setdefault("acceptability_mean", 1.0)
+        sem_dict.setdefault("acceptability_min", 1.0)
+        sem_dict.setdefault("acceptability_score", sem_dict["acceptability_min"])
+        row: dict[str, Any] = {
+            "method": name,
+            "split": split,
+            "sample_id": sample.sample_id,
+            "domain": sample.domain,
+            "original": sample.text,
+            "rewritten": rew,
+            "latency_ms": lat,
+            **feat.to_dict(),
+            **sem_dict,
+        }
+        is_ool = getattr(sample, "is_out_of_lexicon", None)
+        if is_ool is not None:
+            row["is_out_of_lexicon"] = bool(is_ool)
+        rows.append(row)
     return rows
 
 
@@ -117,9 +218,12 @@ def _plot_comparison(
     summaries_dense: list[dict[str, Any]],
     domain_breakdowns: list[dict[str, Any]],
     summaries_multipara: list[dict[str, Any]],
-    human_ref: dict[str, float],
+    human_ref: dict[str, float] | None,
     out_path: Path,
 ) -> None:
+    if not summaries_dense:
+        return
+
     dense_df = pd.DataFrame(summaries_dense)
     methods = dense_df["method"].tolist()
     palette = [
@@ -149,17 +253,27 @@ def _plot_comparison(
         linewidths=0.9,
         zorder=4,
     )
-    ax.scatter(
-        [human_ref["difficulty_score"]],
-        [1.0],
-        s=220,
-        marker="*",
-        c="#eab308",
-        edgecolors="#111827",
-        linewidths=0.9,
-        zorder=5,
-        label="Human Reference",
-    )
+    if human_ref and "difficulty_score" in human_ref:
+        ax.scatter(
+            [human_ref["difficulty_score"]],
+            [1.0],
+            s=220,
+            marker="*",
+            c="#eab308",
+            edgecolors="#111827",
+            linewidths=0.9,
+            zorder=5,
+            label="Human Reference",
+        )
+        ax.annotate(
+            "Human Reference",
+            (human_ref["difficulty_score"], 1.0),
+            textcoords="offset points",
+            xytext=(8, -4),
+            fontsize=8,
+            fontweight="bold",
+            color="#854d0e",
+        )
     for idx, row in dense_df.iterrows():
         dy = 6 if idx % 2 == 0 else -12
         ax.annotate(
@@ -170,15 +284,6 @@ def _plot_comparison(
             fontsize=8,
             color="#1f2937",
         )
-    ax.annotate(
-        "Human Reference",
-        (human_ref["difficulty_score"], 1.0),
-        textcoords="offset points",
-        xytext=(8, -4),
-        fontsize=8,
-        fontweight="bold",
-        color="#854d0e",
-    )
     ax.invert_xaxis()
     ax.set_ylim(0.0, 1.08)
     ax.set_xlabel("Psycholinguistic Difficulty Score (right = clearer)", fontsize=9.5)
@@ -190,20 +295,44 @@ def _plot_comparison(
     ax = axes[1]
     dom_map = {d["method"]: d for d in domain_breakdowns}
     x = np.arange(len(methods))
-    w = 0.25
-    dom_colors = {"chat": "#2563eb", "coding": "#059669", "essay": "#d97706"}
-    for offset, dom in zip((-w, 0.0, w), DOMAINS):
-        vals = [dom_map.get(m, {}).get(dom, {}).get("nli_min_entailment", 0.0) for m in methods]
-        ax.bar(x + offset, vals, width=w, label=dom.capitalize(), color=dom_colors[dom], alpha=0.9)
+    active_domains = [
+        d for d in DOMAINS if any(d in row for row in domain_breakdowns)
+    ]
+    if not active_domains:
+        extra_domains: list[str] = []
+        for row in domain_breakdowns:
+            for k in row:
+                if k != "method" and k not in extra_domains:
+                    extra_domains.append(k)
+        active_domains = extra_domains[:4]
+
+    if active_domains:
+        w = 0.75 / max(len(active_domains), 1)
+        dom_palette = ["#2563eb", "#059669", "#d97706", "#7c3aed"]
+        offsets = np.linspace(
+            -w * (len(active_domains) - 1) / 2.0,
+            w * (len(active_domains) - 1) / 2.0,
+            len(active_domains),
+        )
+        for idx_d, (offset, dom) in enumerate(zip(offsets, active_domains)):
+            vals = [dom_map.get(m, {}).get(dom, {}).get("nli_min_entailment", 0.0) for m in methods]
+            ax.bar(
+                x + offset,
+                vals,
+                width=w,
+                label=dom.capitalize(),
+                color=dom_palette[idx_d % len(dom_palette)],
+                alpha=0.9,
+            )
+        ax.legend(fontsize=8.5, frameon=True, loc="lower right")
     ax.set_xticks(x)
     ax.set_xticklabels(methods, rotation=28, ha="right", fontsize=8)
     ax.set_ylim(0.0, 1.08)
     ax.set_ylabel("Bidirectional NLI Min-Entailment", fontsize=9.5)
     ax.set_title("Domain NLI Fidelity Breakdown", fontsize=11, fontweight="bold")
     ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.legend(fontsize=8.5, frameon=True, loc="lower right")
 
-    # Panel 3: Single-Sentence vs Multi-Paragraph Difficulty & NLI Comparison
+    # Panel 3: Single-Sentence vs Multi-Paragraph (or Acceptability Min when single-split)
     ax = axes[2]
     if summaries_multipara:
         mp_map = {r["method"]: r for r in summaries_multipara}
@@ -255,17 +384,17 @@ def _plot_comparison(
         ax.legend(h1 + h2, l1 + l2, fontsize=7.5, frameon=True, loc="upper right")
     else:
         vals = dense_df["difficulty_score"].tolist()
-        contras = dense_df["nli_max_contradiction"].tolist()
+        acc_mins = dense_df["acceptability_min"].tolist() if "acceptability_min" in dense_df else [1.0] * len(methods)
         bars = ax.barh(methods, vals, color=colors, edgecolor="none", height=0.6)
         ax.invert_yaxis()
         ax.set_xlabel("Psycholinguistic Difficulty Score (lower = clearer)", fontsize=9.5)
-        ax.set_title("Difficulty & Max Contradiction", fontsize=11, fontweight="bold")
+        ax.set_title("Difficulty & CoLA Acceptability Min", fontsize=11, fontweight="bold")
         ax.grid(axis="x", linestyle="--", alpha=0.35)
-        for bar, v, c in zip(bars, vals, contras):
+        for bar, v, acc in zip(bars, vals, acc_mins):
             ax.text(
                 v + 0.8,
                 bar.get_y() + bar.get_height() / 2,
-                f"{v:.1f} (contra={c:.2f})",
+                f"{v:.1f} (acc_min={acc:.2f})",
                 va="center",
                 fontsize=8,
             )
@@ -291,15 +420,15 @@ def _append_main_table(
     md_lines: list[str],
     title: str,
     summaries: list[dict[str, Any]],
-    human_ref: dict[str, float],
+    human_ref: dict[str, float] | None,
     ref_label: str,
 ) -> None:
     md_lines.extend(
         [
             title,
             "",
-            "| Method | Diff Score ↓ | Unatt. Bigram ↓ | Trigram PPL ↓ | Mean Dep Len ↓ | Red. ORC /100w ↓ | Stacked N /100w ↓ | Denom. V /100w ↓ | Inanim. Subj /100w ↓ | Cos Sim ↑ | NLI Min ↑ | NLI Contra ↓ | GPT-2 PPL ↓ | Code Pres ↑ | Latency (ms) |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Method | Diff Score ↓ | Unatt. Bigram ↓ | Trigram PPL ↓ | Mean Dep Len ↓ | Red. ORC /100w ↓ | Stacked N /100w ↓ | Denom. V /100w ↓ | Inanim. Subj /100w ↓ | Cos Sim ↑ | NLI Min ↑ | NLI Contra ↓ | GPT-2 PPL ↓ | Acc Mean ↑ | Acc Min ↑ | Code Pres ↑ | Latency (ms) |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for r in summaries:
@@ -309,14 +438,18 @@ def _append_main_table(
             f"{r['stacked_noun_per_100w']:.2f} | {r['denominal_verb_per_100w']:.2f} | "
             f"{r['inanimate_subj_per_100w']:.2f} | {r['cosine_similarity']:.3f} | "
             f"{r['nli_min_entailment']:.3f} | {r['nli_max_contradiction']:.3f} | "
-            f"{r['gpt2_perplexity']:.1f} | {r['code_preservation']:.3f} | {r['latency_ms']:.0f} |"
+            f"{r['gpt2_perplexity']:.1f} | {r.get('acceptability_mean', 1.0):.3f} | "
+            f"{r.get('acceptability_min', 1.0):.3f} | {r['code_preservation']:.3f} | {r['latency_ms']:.0f} |"
         )
-    md_lines.append(
-        f"| *{ref_label}* | *{human_ref['difficulty_score']:.1f}* | *{human_ref['unattested_bigram_rate']:.3f}* | "
-        f"*{human_ref['trigram_perplexity']:.1f}* | *{human_ref['mean_dep_length']:.2f}* | *{human_ref['reduced_orc_per_100w']:.2f}* | "
-        f"*{human_ref['stacked_noun_per_100w']:.2f}* | *{human_ref['denominal_verb_per_100w']:.2f}* | "
-        f"*{human_ref['inanimate_subj_per_100w']:.2f}* | *1.000* | *1.000* | *0.000* | *{human_ref['gpt2_perplexity']:.1f}* | *1.000* | *-* |"
-    )
+    if human_ref and "difficulty_score" in human_ref:
+        md_lines.append(
+            f"| *{ref_label}* | *{human_ref['difficulty_score']:.1f}* | *{human_ref['unattested_bigram_rate']:.3f}* | "
+            f"*{human_ref['trigram_perplexity']:.1f}* | *{human_ref['mean_dep_length']:.2f}* | *{human_ref['reduced_orc_per_100w']:.2f}* | "
+            f"*{human_ref['stacked_noun_per_100w']:.2f}* | *{human_ref['denominal_verb_per_100w']:.2f}* | "
+            f"*{human_ref['inanimate_subj_per_100w']:.2f}* | *1.000* | *1.000* | *0.000* | "
+            f"*{human_ref['gpt2_perplexity']:.1f}* | *{human_ref.get('acceptability_mean', 1.0):.3f}* | "
+            f"*{human_ref.get('acceptability_min', 1.0):.3f}* | *1.000* | *-* |"
+        )
 
 
 def _append_domain_table(
@@ -324,23 +457,74 @@ def _append_domain_table(
     title: str,
     domain_breakdowns: list[dict[str, Any]],
 ) -> None:
+    if not domain_breakdowns:
+        return
+    if any("chat" in row or "coding" in row or "essay" in row for row in domain_breakdowns):
+        md_lines.extend(
+            [
+                "",
+                title,
+                "",
+                "| Method | Chat Diff ↓ | Chat NLI ↑ | Coding Diff ↓ | Coding NLI ↑ | Coding Code ↑ | Essay Diff ↓ | Essay NLI ↑ |",
+                "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in domain_breakdowns:
+            c = row.get("chat", {})
+            k = row.get("coding", {})
+            e = row.get("essay", {})
+            md_lines.append(
+                f"| {row['method']} | {c.get('difficulty_score', 0.0):.1f} | {c.get('nli_min_entailment', 0.0):.3f} | "
+                f"{k.get('difficulty_score', 0.0):.1f} | {k.get('nli_min_entailment', 0.0):.3f} | {k.get('code_preservation', 0.0):.3f} | "
+                f"{e.get('difficulty_score', 0.0):.1f} | {e.get('nli_min_entailment', 0.0):.3f} |"
+            )
+        return
+
+    extra_domains: list[str] = []
+    for row in domain_breakdowns:
+        for k in row:
+            if k != "method" and k not in extra_domains:
+                extra_domains.append(k)
+    if not extra_domains:
+        return
+
+    header = "| Method | " + " | ".join(f"{d} Diff ↓ | {d} NLI ↑ | {d} Acc Min ↑" for d in extra_domains) + " |"
+    sep = "| :--- | " + " | ".join("---: | ---: | ---:" for _ in extra_domains) + " |"
+    md_lines.extend(["", title, "", header, sep])
+    for row in domain_breakdowns:
+        cells = []
+        for d in extra_domains:
+            sub = row.get(d, {})
+            cells.append(
+                f"{sub.get('difficulty_score', 0.0):.1f} | {sub.get('nli_min_entailment', 0.0):.3f} | {sub.get('acceptability_min', 1.0):.3f}"
+            )
+        md_lines.append(f"| {row['method']} | " + " | ".join(cells) + " |")
+
+
+def _append_out_of_lexicon_table(
+    md_lines: list[str],
+    title: str,
+    ool_breakdowns: list[dict[str, Any]],
+) -> None:
+    if not ool_breakdowns:
+        return
     md_lines.extend(
         [
             "",
             title,
             "",
-            "| Method | Chat Diff ↓ | Chat NLI ↑ | Coding Diff ↓ | Coding NLI ↑ | Coding Code ↑ | Essay Diff ↓ | Essay NLI ↑ |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Method | OOL Diff ↓ | OOL NLI ↑ | OOL Acc Mean ↑ | OOL Acc Min ↑ | In-Lex Diff ↓ | In-Lex NLI ↑ | In-Lex Acc Mean ↑ | In-Lex Acc Min ↑ |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for row in domain_breakdowns:
-        c = row.get("chat", {})
-        k = row.get("coding", {})
-        e = row.get("essay", {})
+    for row in ool_breakdowns:
+        ool = row.get("out_of_lexicon", {})
+        inl = row.get("in_lexicon", {})
         md_lines.append(
-            f"| {row['method']} | {c.get('difficulty_score', 0.0):.1f} | {c.get('nli_min_entailment', 0.0):.3f} | "
-            f"{k.get('difficulty_score', 0.0):.1f} | {k.get('nli_min_entailment', 0.0):.3f} | {k.get('code_preservation', 0.0):.3f} | "
-            f"{e.get('difficulty_score', 0.0):.1f} | {e.get('nli_min_entailment', 0.0):.3f} |"
+            f"| {row['method']} | {ool.get('difficulty_score', 0.0):.1f} | {ool.get('nli_min_entailment', 0.0):.3f} | "
+            f"{ool.get('acceptability_mean', 0.0):.3f} | {ool.get('acceptability_min', 0.0):.3f} | "
+            f"{inl.get('difficulty_score', 0.0):.1f} | {inl.get('nli_min_entailment', 0.0):.3f} | "
+            f"{inl.get('acceptability_mean', 0.0):.3f} | {inl.get('acceptability_min', 0.0):.3f} |"
         )
 
 
@@ -349,21 +533,107 @@ def _append_human_control_table(
     title: str,
     summaries: list[dict[str, Any]],
 ) -> None:
+    if not summaries:
+        return
     md_lines.extend(
         [
             "",
             title,
             "",
-            "| Method | Diff Score | Cos Sim ↑ | NLI Min ↑ | NLI Contra ↓ | Code Pres ↑ | Length Ratio |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Method | Diff Score | Cos Sim ↑ | NLI Min ↑ | NLI Contra ↓ | Acc Mean ↑ | Acc Min ↑ | Code Pres ↑ | Length Ratio |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for r in summaries:
         md_lines.append(
             f"| {r['method']} | {r['difficulty_score']:.1f} | {r['cosine_similarity']:.3f} | "
             f"{r['nli_min_entailment']:.3f} | {r['nli_max_contradiction']:.3f} | "
+            f"{r.get('acceptability_mean', 1.0):.3f} | {r.get('acceptability_min', 1.0):.3f} | "
             f"{r['code_preservation']:.3f} | {r['length_ratio']:.2f} |"
         )
+
+
+def _append_blind_judge_table(
+    md_lines: list[str],
+    title: str,
+    judge_summaries: list[dict[str, Any]],
+    baseline_name: str,
+) -> None:
+    if not judge_summaries:
+        return
+    md_lines.extend(
+        [
+            "",
+            title,
+            "",
+            f"| Method (vs {baseline_name}) | Pairs | Win % ↑ | Tie % | Loss % ↓ | Agree % | Clarity ↑ | Naturalness ↑ | Meaning ↑ |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for s in judge_summaries:
+        ma = s.get("mean_scores_a", {})
+        md_lines.append(
+            f"| {s['method_a']} | {s['total_pairs']} | {s['win_rate_a'] * 100:.1f}% | "
+            f"{s['tie_rate'] * 100:.1f}% | {s['win_rate_b'] * 100:.1f}% | "
+            f"{s['agreement_rate'] * 100:.1f}% | {ma.get('clarity', 0.0):.2f} | "
+            f"{ma.get('naturalness', 0.0):.2f} | {ma.get('meaning_preservation', 0.0):.2f} |"
+        )
+
+
+def _run_blind_judge_comparisons(
+    all_rows: list[dict[str, Any]],
+    *,
+    primary_split: str,
+    baseline_method: str,
+    judge_model: str | None,
+    judge_max_samples: int,
+) -> list[dict[str, Any]]:
+    """Run blind position-swapped pairwise LLM judge comparing each method vs baseline_method."""
+    split_rows = [
+        r for r in all_rows if r.get("split") == primary_split and r.get("domain") != "human_control"
+    ]
+    by_method: dict[str, dict[str, dict[str, Any]]] = {}
+    method_order: list[str] = []
+    for row in split_rows:
+        m = row["method"]
+        if m not in by_method:
+            by_method[m] = {}
+            method_order.append(m)
+        by_method[m][row["sample_id"]] = row
+
+    if baseline_method not in by_method:
+        return []
+
+    base_map = by_method[baseline_method]
+    sample_ids = list(base_map.keys())[: max(1, int(judge_max_samples))]
+    summaries: list[dict[str, Any]] = []
+
+    with BlindPairwiseJudge(model=judge_model) as judge:
+        for method in method_order:
+            if method == baseline_method:
+                continue
+            cand_map = by_method[method]
+            pairs = [
+                (
+                    sid,
+                    base_map[sid]["original"],
+                    cand_map[sid]["rewritten"],
+                    base_map[sid]["rewritten"],
+                )
+                for sid in sample_ids
+                if sid in cand_map
+            ]
+            if not pairs:
+                continue
+            summary = judge.evaluate_pairs(pairs, method_a=method, method_b=baseline_method)
+            summaries.append(summary.to_dict())
+            print(
+                f"  [Blind Judge: {method} vs {baseline_method}] "
+                f"win={summary.win_rate_a * 100:.1f}% tie={summary.tie_rate * 100:.1f}% "
+                f"loss={summary.win_rate_b * 100:.1f}% agree={summary.agreement_rate * 100:.1f}%"
+            )
+
+    return summaries
 
 
 def run_benchmark(
@@ -373,16 +643,42 @@ def run_benchmark(
     skip_nllb: bool = False,
     skip_multipara: bool = False,
     nli_model: str | None = None,
+    *,
+    dataset_path: Path | None = None,
+    lm_model: str | None = None,
+    enable_acceptability: bool = True,
+    blind_judge: bool = False,
+    judge_model: str | None = None,
+    judge_baseline: str = "Original",
+    judge_max_samples: int = 20,
 ) -> dict[str, Any]:
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     analyzer = PsycholinguisticAnalyzer()
-    semantics = SemanticEvaluator(nli_model=nli_model) if nli_model else SemanticEvaluator()
+    semantics = HeldOutSemanticEvaluator(
+        nli_model=nli_model or DEFAULT_EVAL_NLI_MODEL,
+        lm_model=lm_model or DEFAULT_HELDOUT_FLUENCY_MODEL,
+        enable_acceptability=enable_acceptability,
+    )
     classical = ClassicalReverser()
+
+    use_external = dataset_path is not None
+    if use_external:
+        ext_test_samples, ext_control_samples = load_jsonl_dataset(Path(dataset_path))
+        primary_samples: Sequence[BenchmarkSample | EvalSample] = ext_test_samples
+        control_samples: Sequence[BenchmarkSample | EvalSample] = ext_control_samples
+        primary_split = "external"
+        effective_skip_multipara = True
+    else:
+        primary_samples = TEST_BENCHMARK
+        control_samples = HUMAN_CONTROL
+        primary_split = "single"
+        effective_skip_multipara = skip_multipara
 
     all_rows: list[dict[str, Any]] = []
     summaries_dense: list[dict[str, Any]] = []
     domain_dense: list[dict[str, Any]] = []
+    ool_dense: list[dict[str, Any]] = []
     summaries_human: list[dict[str, Any]] = []
 
     summaries_multipara: list[dict[str, Any]] = []
@@ -396,27 +692,47 @@ def run_benchmark(
     ) -> None:
         print(f"=== Running method: {name} ===")
         dense_rows = _evaluate_method(
-            name, TEST_BENCHMARK, fn, analyzer, semantics, split="single", extra_latency_fn=extra_latency_fn
-        )
-        human_rows = _evaluate_method(
-            name, HUMAN_CONTROL, fn, analyzer, semantics, split="single", extra_latency_fn=extra_latency_fn
+            name,
+            primary_samples,
+            fn,
+            analyzer,
+            semantics,
+            split=primary_split,
+            extra_latency_fn=extra_latency_fn,
         )
         all_rows.extend(dense_rows)
-        all_rows.extend(human_rows)
 
         s_dense = {"method": name, **_summarize_rows(dense_rows)}
-        s_human = {"method": name, **_summarize_rows(human_rows)}
         summaries_dense.append(s_dense)
         domain_dense.append({"method": name, **_summarize_by_domain(dense_rows)})
-        summaries_human.append(s_human)
+        ool_stats = _summarize_out_of_lexicon(dense_rows)
+        if ool_stats:
+            ool_dense.append({"method": name, **ool_stats})
+
+        if control_samples:
+            human_rows = _evaluate_method(
+                name,
+                control_samples,
+                fn,
+                analyzer,
+                semantics,
+                split=primary_split,
+                extra_latency_fn=extra_latency_fn,
+            )
+            all_rows.extend(human_rows)
+            s_human = {"method": name, **_summarize_rows(human_rows)}
+            summaries_human.append(s_human)
+
+        split_tag = "External" if use_external else "Single Dense"
         print(
-            f"  [Single Dense] diff={s_dense['difficulty_score']:.1f} "
+            f"  [{split_tag}] diff={s_dense['difficulty_score']:.1f} "
             f"cos={s_dense['cosine_similarity']:.3f} nli={s_dense['nli_min_entailment']:.3f} "
             f"contra={s_dense['nli_max_contradiction']:.3f} ppl={s_dense['gpt2_perplexity']:.1f} "
+            f"acc={s_dense['acceptability_mean']:.3f}/{s_dense['acceptability_min']:.3f} "
             f"code={s_dense['code_preservation']:.3f} lat={s_dense['latency_ms']:.0f}ms"
         )
 
-        if not skip_multipara:
+        if not effective_skip_multipara:
             mp_dense_rows = _evaluate_method(
                 name,
                 MULTIPARA_BENCHMARK,
@@ -447,70 +763,84 @@ def run_benchmark(
                 f"  [Multi-Para]   diff={s_mp['difficulty_score']:.1f} "
                 f"cos={s_mp['cosine_similarity']:.3f} nli={s_mp['nli_min_entailment']:.3f} "
                 f"contra={s_mp['nli_max_contradiction']:.3f} ppl={s_mp['gpt2_perplexity']:.1f} "
+                f"acc={s_mp['acceptability_mean']:.3f}/{s_mp['acceptability_min']:.3f} "
                 f"code={s_mp['code_preservation']:.3f} lat={s_mp['latency_ms']:.0f}ms"
             )
 
-    # 1. Original baseline
-    _run_and_record("Original", lambda x: x)
+    try:
+        # 1. Original baseline
+        _run_and_record("Original", lambda x: x)
 
-    # 2. Classical rule-based reverser
-    _run_and_record("Classical (spaCy)", classical.rewrite)
+        # 2. Classical rule-based reverser
+        _run_and_record("Classical (spaCy)", classical.rewrite)
 
-    if include_neural:
-        # 3. NLLB-200 Round-Trip Translation (En -> Ja -> En)
-        if not skip_nllb:
-            nllb = NLLBRoundTripReverser("facebook/nllb-200-distilled-600M")
-            _run_and_record("NLLB-200 RTT", nllb.rewrite)
-            nllb.close()
+        if include_neural:
+            # 3. NLLB-200 Round-Trip Translation (En -> Ja -> En)
+            if not skip_nllb:
+                nllb = NLLBRoundTripReverser("facebook/nllb-200-distilled-600M")
+                _run_and_record("NLLB-200 RTT", nllb.rewrite)
+                nllb.close()
 
-        # 4. Qwen2.5-3B-Instruct Zero-Shot + Best-of-6 Psycholinguistic Reranking
-        qwen = QwenZeroShotReverser("Qwen/Qwen2.5-3B-Instruct")
-        _run_and_record("Qwen2.5-3B ZeroShot", qwen.rewrite)
+            # 4. Qwen2.5-3B-Instruct Zero-Shot + Best-of-6 Psycholinguistic Reranking
+            # Use a decoupled fast proxy evaluator for reranking (nli-deberta-v3-small + gpt2)
+            # so held-out evaluation (nli-deberta-v3-base + CoLA + gpt2-medium) stays independent.
+            qwen = QwenZeroShotReverser("Qwen/Qwen2.5-3B-Instruct")
+            _run_and_record("Qwen2.5-3B ZeroShot", qwen.rewrite)
 
-        reranker = BestOfNPsycholinguisticReverser(
-            qwen, analyzer, semantics, num_samples=6, classical_fallback=classical
-        )
-        bon_cache: dict[str, tuple[str, float]] = {}
+            rerank_semantics = SemanticEvaluator(role="rerank", enable_acceptability=False)
+            try:
+                reranker = BestOfNPsycholinguisticReverser(
+                    qwen, analyzer, rerank_semantics, num_samples=6, classical_fallback=classical
+                )
+                bon_cache: dict[str, tuple[str, float]] = {}
 
-        def _bon_cached(text: str) -> str:
-            if text not in bon_cache:
-                t0 = time.perf_counter()
-                rew = reranker.rewrite(text)
-                bon_cache[text] = (rew, (time.perf_counter() - t0) * 1000.0)
-            return bon_cache[text][0]
+                def _bon_cached(text: str) -> str:
+                    if text not in bon_cache:
+                        t0 = time.perf_counter()
+                        rew = reranker.rewrite(text)
+                        bon_cache[text] = (rew, (time.perf_counter() - t0) * 1000.0)
+                    return bon_cache[text][0]
 
-        _run_and_record("Qwen2.5-3B Best-of-6", _bon_cached)
-        _run_and_record(
-            "Hybrid (Best-of-6+Classical)",
-            lambda x: classical.rewrite(bon_cache[x][0]),
-            extra_latency_fn=lambda x: bon_cache[x][1],
-        )
-        qwen.close()
+                _run_and_record("Qwen2.5-3B Best-of-6", _bon_cached)
+                _run_and_record(
+                    "Hybrid (Best-of-6+Classical)",
+                    lambda x: classical.rewrite(bon_cache[x][0]),
+                    extra_latency_fn=lambda x: bon_cache[x][1],
+                )
+            finally:
+                rerank_semantics.close()
+                qwen.close()
 
-        # 5. Fine-tuned LoRA Single-Pass + Hybrid (auto-detects base model from adapter_config.json)
-        if adapter_dir is not None and Path(adapter_dir).exists():
-            lora = LoRASinglePassReverser(adapter_dir, base_model=None, classical_fallback=classical)
-            lora_label = _format_lora_label(lora.base_model_name)
-            lora_cache: dict[str, tuple[str, float]] = {}
+            # 5. Fine-tuned LoRA Single-Pass + Hybrid (auto-detects base model from adapter_config.json)
+            if adapter_dir is not None and Path(adapter_dir).exists():
+                lora = LoRASinglePassReverser(adapter_dir, base_model=None, classical_fallback=classical)
+                lora_label = _format_lora_label(lora.base_model_name)
+                lora_cache: dict[str, tuple[str, float]] = {}
 
-            def _lora_cached(text: str) -> str:
-                if text not in lora_cache:
-                    t0 = time.perf_counter()
-                    rew = lora.rewrite(text)
-                    lora_cache[text] = (rew, (time.perf_counter() - t0) * 1000.0)
-                return lora_cache[text][0]
+                def _lora_cached(text: str) -> str:
+                    if text not in lora_cache:
+                        t0 = time.perf_counter()
+                        rew = lora.rewrite(text)
+                        lora_cache[text] = (rew, (time.perf_counter() - t0) * 1000.0)
+                    return lora_cache[text][0]
 
-            _run_and_record(lora_label, _lora_cached)
-            _run_and_record(
-                "Hybrid (LoRA+Classical)",
-                lambda x: classical.rewrite(lora_cache[x][0]),
-                extra_latency_fn=lambda x: lora_cache[x][1],
-            )
-            lora.close()
+                _run_and_record(lora_label, _lora_cached)
+                _run_and_record(
+                    "Hybrid (LoRA+Classical)",
+                    lambda x: classical.rewrite(lora_cache[x][0]),
+                    extra_latency_fn=lambda x: lora_cache[x][1],
+                )
+                lora.close()
+    finally:
+        semantics.close()
 
-    human_ref = _summarize_rows(
-        [r for r in all_rows if r["method"] == "Original" and r["split"] == "single" and r["domain"] == "human_control"]
-    )
+    human_ref_rows = [
+        r
+        for r in all_rows
+        if r["method"] == "Original" and r["split"] == primary_split and r["domain"] == "human_control"
+    ]
+    human_ref = _summarize_rows(human_ref_rows) if human_ref_rows else {}
+
     human_ref_mp = (
         _summarize_rows(
             [
@@ -519,9 +849,19 @@ def run_benchmark(
                 if r["method"] == "Original" and r["split"] == "multipara" and r["domain"] == "human_control"
             ]
         )
-        if not skip_multipara
+        if not effective_skip_multipara
         else {}
     )
+
+    blind_judge_summary: list[dict[str, Any]] = []
+    if blind_judge:
+        blind_judge_summary = _run_blind_judge_comparisons(
+            all_rows,
+            primary_split=primary_split,
+            baseline_method=judge_baseline,
+            judge_model=judge_model,
+            judge_max_samples=judge_max_samples,
+        )
 
     _plot_comparison(
         summaries_dense=summaries_dense,
@@ -532,35 +872,46 @@ def run_benchmark(
     )
 
     payload: dict[str, Any] = {
+        "dataset_path": str(dataset_path) if dataset_path is not None else None,
         "dense_ai_summary": summaries_dense,
         "dense_ai_by_domain": domain_dense,
+        "out_of_lexicon_breakdown": ool_dense,
         "human_control_summary": summaries_human,
         "human_reference_baseline": human_ref,
         "multipara_summary": summaries_multipara,
         "multipara_by_domain": domain_multipara,
         "human_control_multipara_summary": summaries_human_multipara,
         "human_reference_multipara_baseline": human_ref_mp,
+        "blind_judge_summary": blind_judge_summary,
         "per_sample": all_rows,
     }
-    with open(results_dir / "benchmark_results.json", "w") as f:
+    with open(results_dir / "benchmark_results.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
     md_lines: list[str] = ["# Psycholinguistic Reversal Benchmark Results", ""]
+    primary_title = (
+        f"## External Dataset Test Set ({len(primary_samples)} passages from `{Path(dataset_path).name}`)"
+        if use_external and dataset_path is not None
+        else f"## Dense AI Single-Sentence Test Set ({len(primary_samples)} passages: Chat, Coding, Essay)"
+    )
     _append_main_table(
         md_lines,
-        f"## Dense AI Single-Sentence Test Set ({len(TEST_BENCHMARK)} passages: Chat, Coding, Essay)",
+        primary_title,
         summaries_dense,
         human_ref,
-        f"Human Reference ({len(HUMAN_CONTROL)} control)",
+        f"Human Reference ({len(control_samples)} control)",
     )
-    _append_domain_table(md_lines, "### Single-Sentence Per-Domain Breakdown", domain_dense)
-    _append_human_control_table(
-        md_lines,
-        f"## Human Control Set — Single-Sentence ({len(HUMAN_CONTROL)} natural passages)",
-        summaries_human,
-    )
+    _append_domain_table(md_lines, "### Per-Domain Breakdown", domain_dense)
+    if ool_dense:
+        _append_out_of_lexicon_table(md_lines, "### Out-of-Lexicon vs In-Lexicon Breakdown", ool_dense)
+    if summaries_human:
+        _append_human_control_table(
+            md_lines,
+            f"## Human Control Set ({len(control_samples)} natural passages)",
+            summaries_human,
+        )
 
-    if not skip_multipara and summaries_multipara:
+    if not effective_skip_multipara and summaries_multipara:
         md_lines.append("")
         _append_main_table(
             md_lines,
@@ -576,7 +927,15 @@ def run_benchmark(
             summaries_human_multipara,
         )
 
-    with open(results_dir / "summary.md", "w") as f:
+    if blind_judge_summary:
+        _append_blind_judge_table(
+            md_lines,
+            f"## Blind Pairwise LLM-as-a-Judge (Position-Swapped vs {judge_baseline})",
+            blind_judge_summary,
+            judge_baseline,
+        )
+
+    with open(results_dir / "summary.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md_lines) + "\n")
 
     return payload
@@ -585,7 +944,7 @@ def run_benchmark(
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python -m psycho_rev.evaluate",
-        description="Run single-sentence and multi-paragraph psycholinguistic reversal benchmarks.",
+        description="Run single-sentence, multi-paragraph, or external JSONL psycholinguistic reversal benchmarks.",
     )
     parser.add_argument("--results-dir", type=Path, default=Path("results"), help="Output directory for results.")
     parser.add_argument(
@@ -597,7 +956,44 @@ def main() -> None:
     parser.add_argument("--classical-only", action="store_true", help="Skip all neural models.")
     parser.add_argument("--skip-nllb", action="store_true", help="Skip NLLB-200 round-trip translation baseline.")
     parser.add_argument("--skip-multipara", action="store_true", help="Skip multi-paragraph benchmark split.")
-    parser.add_argument("--nli-model", default=None, help="Optional NLI cross-encoder model override.")
+    parser.add_argument("--nli-model", default=None, help="Optional held-out NLI cross-encoder model override.")
+    parser.add_argument(
+        "--lm-model",
+        default=None,
+        help="Optional held-out LM perplexity model override (default: gpt2-medium).",
+    )
+    parser.add_argument(
+        "--disable-acceptability",
+        action="store_true",
+        help="Disable CoLA grammatical acceptability scoring.",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=None,
+        help="Path to external JSONL dataset to evaluate (supports is_out_of_lexicon breakdown).",
+    )
+    parser.add_argument(
+        "--blind-judge",
+        action="store_true",
+        help="Run blind position-swapped pairwise LLM-as-a-judge against --judge-baseline.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Model identifier for BlindPairwiseJudge (defaults to provider's gpt-4o-mini).",
+    )
+    parser.add_argument(
+        "--judge-baseline",
+        default="Original",
+        help="Baseline method name to compare against when --blind-judge is enabled.",
+    )
+    parser.add_argument(
+        "--judge-max-samples",
+        type=int,
+        default=20,
+        help="Maximum number of samples per method pair for blind pairwise judging.",
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -607,6 +1003,13 @@ def main() -> None:
         skip_nllb=args.skip_nllb,
         skip_multipara=args.skip_multipara,
         nli_model=args.nli_model,
+        dataset_path=args.dataset_path,
+        lm_model=args.lm_model,
+        enable_acceptability=not args.disable_acceptability,
+        blind_judge=args.blind_judge,
+        judge_model=args.judge_model,
+        judge_baseline=args.judge_baseline,
+        judge_max_samples=args.judge_max_samples,
     )
 
 
