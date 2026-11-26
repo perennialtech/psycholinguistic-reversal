@@ -16,11 +16,13 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import math
 import random
 import shutil
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,8 @@ from psycho_rev.neural import (
     QwenZeroShotReverser,
 )
 from psycho_rev.semantics import SemanticEvaluator
+
+logger = logging.getLogger(__name__)
 
 _TERMINAL_PUNCT = (".", "!", "?", '"', "'", ")", "]", "`")
 _DANGLING_PUNCT = (",", ";", ":", "(", "[", "{")
@@ -235,7 +239,7 @@ def filter_distilled_records(
 
         # Exact code/URL span preservation check
         computed_cp = code_preservation_rate(src, tgt)
-        meta_cp = _first_numeric(rec, ("code_preservation",))
+        meta_cp = _first_numeric(rec, ("code_preservation", "code_preservation_rate"))
         effective_cp = min(computed_cp, meta_cp) if meta_cp is not None else computed_cp
         if effective_cp < min_code_preservation:
             stats["rejected_code_preservation"] += 1
@@ -426,21 +430,39 @@ def format_rewrite_messages(src: str, tgt: str | None = None) -> list[dict[str, 
         {"role": "user", "content": f"Rewrite this passage clearly:\n\n{g_src.masked}"},
     ]
     if tgt is not None:
-        g_tgt = tgt
-        # Replace longer originals first to avoid partial substring collisions
-        for tok, orig in sorted(g_src.placeholders.items(), key=lambda kv: len(kv[1]), reverse=True):
-            g_tgt = g_tgt.replace(orig, tok)
+        if tgt == src:
+            g_tgt = g_src.masked
+        else:
+            g_tgt = tgt
+            # Replace longer originals first to avoid partial substring collisions,
+            # preserving occurrence order for duplicate spans with count=1 so each
+            # occurrence maps to its distinct CODEITEM<k> token.
+            ordered_spans = sorted(
+                g_src.placeholders.items(),
+                key=lambda kv: -len(kv[1]),
+            )
+            for tok, orig in ordered_spans:
+                g_tgt = g_tgt.replace(orig, tok, 1)
         messages.append({"role": "assistant", "content": g_tgt})
     return messages
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    """Split a document into non-empty paragraphs separated by blank lines."""
+    return [para.strip() for para in text.strip().split("\n\n") if para.strip()]
 
 
 def encode_pair(
     src: str,
     tgt: str,
     tokenizer: Any,
-    max_len: int = 768,
-) -> dict[str, torch.Tensor]:
-    """Tokenize a (source, target) pair with prompt tokens masked to -100 in labels."""
+    max_len: int = 1024,
+) -> dict[str, torch.Tensor] | None:
+    """Tokenize a (source, target) pair with prompt tokens masked to -100 in labels.
+
+    Returns ``None`` if the full sequence exceeds ``max_len`` (never slicing mid-sentence
+    or dropping the closing EOS token) or if no response tokens are present.
+    """
     prompt_msgs = format_rewrite_messages(src)
     full_msgs = format_rewrite_messages(src, tgt)
 
@@ -449,10 +471,9 @@ def encode_pair(
     prompt_ids = list(p_enc["input_ids"]) if not isinstance(p_enc, list) else list(p_enc)
     full_ids = list(f_enc["input_ids"]) if not isinstance(f_enc, list) else list(f_enc)
 
-    if len(full_ids) > max_len:
-        full_ids = full_ids[:max_len]
-    prompt_cutoff = min(len(prompt_ids), len(full_ids))
-    labels = [-100] * prompt_cutoff + full_ids[prompt_cutoff:]
+    if len(full_ids) > max_len or len(full_ids) <= len(prompt_ids):
+        return None
+    labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids) :]
     return {
         "input_ids": torch.tensor(full_ids, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
@@ -463,16 +484,39 @@ _encode_pair = encode_pair
 
 
 class SFTDataset(Dataset):
-    def __init__(self, pairs: list[tuple[str, str]], tokenizer: Any, max_len: int = 768):
+    def __init__(self, pairs: list[tuple[str, str]], tokenizer: Any, max_len: int = 1024):
         self.items: list[dict[str, torch.Tensor]] = []
         self.dropped_truncated: int = 0
+        self.split_multipara_docs: int = 0
         for src, tgt in pairs:
             encoded = encode_pair(src, tgt, tokenizer, max_len=max_len)
-            # Drop examples whose response tokens were completely truncated away
-            if (encoded["labels"] != -100).any():
+            if encoded is not None:
                 self.items.append(encoded)
+                continue
+
+            src_paras = _split_paragraphs(src)
+            tgt_paras = _split_paragraphs(tgt)
+            if len(src_paras) > 1 and len(src_paras) == len(tgt_paras):
+                kept_any = False
+                for s_para, t_para in zip(src_paras, tgt_paras):
+                    sub_enc = encode_pair(s_para, t_para, tokenizer, max_len=max_len)
+                    if sub_enc is not None:
+                        self.items.append(sub_enc)
+                        kept_any = True
+                    else:
+                        self.dropped_truncated += 1
+                if kept_any:
+                    self.split_multipara_docs += 1
             else:
                 self.dropped_truncated += 1
+
+        if self.dropped_truncated > 0:
+            logger.warning(
+                "SFTDataset dropped %d oversized example(s) exceeding max_len=%d (split %d multi-paragraph doc(s)).",
+                self.dropped_truncated,
+                max_len,
+                self.split_multipara_docs,
+            )
 
     def __len__(self) -> int:
         return len(self.items)
@@ -488,14 +532,15 @@ class PreferenceDataset(Dataset):
         self,
         triples: list[tuple[str, str, str]],
         tokenizer: Any,
-        max_len: int = 768,
+        max_len: int = 1024,
     ):
         self.items: list[dict[str, torch.Tensor]] = []
         self.dropped_truncated: int = 0
+        self.split_multipara_docs: int = 0
         for src, chosen, rejected in triples:
             c_enc = encode_pair(src, chosen, tokenizer, max_len=max_len)
             r_enc = encode_pair(src, rejected, tokenizer, max_len=max_len)
-            if (c_enc["labels"] != -100).any() and (r_enc["labels"] != -100).any():
+            if c_enc is not None and r_enc is not None:
                 self.items.append(
                     {
                         "chosen_input_ids": c_enc["input_ids"],
@@ -504,8 +549,49 @@ class PreferenceDataset(Dataset):
                         "rejected_labels": r_enc["labels"],
                     }
                 )
+                continue
+
+            src_paras = _split_paragraphs(src)
+            chosen_paras = _split_paragraphs(chosen)
+            rejected_paras = _split_paragraphs(rejected)
+            if (
+                len(src_paras) > 1
+                and len(src_paras) == len(chosen_paras) == len(rejected_paras)
+            ):
+                kept_any = False
+                dropped_sub = 0
+                for s_para, c_para, r_para in zip(src_paras, chosen_paras, rejected_paras):
+                    if c_para == r_para:
+                        continue
+                    sc_enc = encode_pair(s_para, c_para, tokenizer, max_len=max_len)
+                    sr_enc = encode_pair(s_para, r_para, tokenizer, max_len=max_len)
+                    if sc_enc is not None and sr_enc is not None:
+                        self.items.append(
+                            {
+                                "chosen_input_ids": sc_enc["input_ids"],
+                                "chosen_labels": sc_enc["labels"],
+                                "rejected_input_ids": sr_enc["input_ids"],
+                                "rejected_labels": sr_enc["labels"],
+                            }
+                        )
+                        kept_any = True
+                    else:
+                        dropped_sub += 1
+                if kept_any:
+                    self.split_multipara_docs += 1
+                    self.dropped_truncated += dropped_sub
+                else:
+                    self.dropped_truncated += max(dropped_sub, 1)
             else:
                 self.dropped_truncated += 1
+
+        if self.dropped_truncated > 0:
+            logger.warning(
+                "PreferenceDataset dropped %d oversized triple(s) exceeding max_len=%d (split %d multi-paragraph doc(s)).",
+                self.dropped_truncated,
+                max_len,
+                self.split_multipara_docs,
+            )
 
     def __len__(self) -> int:
         return len(self.items)
@@ -608,12 +694,23 @@ def compute_simpo_loss(
     }
 
 
-def _eval_sft_loss(model: torch.nn.Module, loader: DataLoader, device: str) -> float:
+def _autocast_ctx(device: str, compute_dtype: torch.dtype | None):
+    if device == "cuda" and compute_dtype is not None:
+        return torch.amp.autocast(device_type="cuda", dtype=compute_dtype)
+    return nullcontext()
+
+
+def _eval_sft_loss(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: str,
+    compute_dtype: torch.dtype | None = None,
+) -> float:
     if len(loader) == 0:
         return 0.0
     model.eval()
     total = 0.0
-    with torch.inference_mode():
+    with torch.inference_mode(), _autocast_ctx(device, compute_dtype):
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             total += model(**batch).loss.item()
@@ -628,6 +725,7 @@ def _eval_simpo_loss(
     beta: float,
     gamma: float,
     sft_anchor_weight: float,
+    compute_dtype: torch.dtype | None = None,
 ) -> tuple[float, float, float]:
     if len(loader) == 0:
         return 0.0, 0.0, 0.0
@@ -635,7 +733,7 @@ def _eval_simpo_loss(
     total_loss = 0.0
     total_margin = 0.0
     total_acc = 0.0
-    with torch.inference_mode():
+    with torch.inference_mode(), _autocast_ctx(device, compute_dtype):
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             c_logp = _sequence_avg_logp(
@@ -748,74 +846,79 @@ def build_distillation_pairs(
 
     analyzer = PsycholinguisticAnalyzer()
     semantics = SemanticEvaluator(nli_model=nli_model) if nli_model else SemanticEvaluator()
-    teacher = QwenZeroShotReverser(model_name=teacher_model)
-    reranker = BestOfNPsycholinguisticReverser(teacher, analyzer, semantics, num_samples=num_samples)
+    teacher: QwenZeroShotReverser | None = None
+    try:
+        teacher = QwenZeroShotReverser(model_name=teacher_model)
+        reranker = BestOfNPsycholinguisticReverser(teacher, analyzer, semantics, num_samples=num_samples)
 
-    newly_processed = 0
-    for idx, src in remaining:
-        orig_feat = analyzer.analyze(src)
-        ranked = reranker.rewrite_ranked_all(src)
-        best = ranked[0]
-        drop = orig_feat.difficulty_score - best.difficulty_score
-        contra = float(best.nli_max_contradiction)
-        lratio = float(best.length_ratio)
+        newly_processed = 0
+        for idx, src in remaining:
+            orig_feat = analyzer.analyze(src)
+            ranked = reranker.rewrite_ranked_all(src)
+            best = ranked[0]
+            drop = orig_feat.difficulty_score - best.difficulty_score
+            contra = float(best.nli_max_contradiction)
+            lratio = float(best.length_ratio)
 
-        keep = (
-            drop >= 10.0
-            and best.cosine_similarity >= 0.80
-            and best.nli_min_entailment >= 0.72
-            and contra <= 0.10
-            and best.code_preservation >= 1.0
-            and 0.65 <= lratio <= 1.85
-        )
-
-        record: dict[str, Any] | None = None
-        if keep:
-            rejected_cand = next((c for c in reversed(ranked[1:]) if c.text != best.text), None)
-            rejected_text = rejected_cand.text if rejected_cand is not None else src
-            rejected_obj = rejected_cand.objective if rejected_cand is not None else None
-            record = {
-                "id": f"train_{idx:03d}",
-                "source": src,
-                "target": best.text,
-                "chosen": best.text,
-                "rejected": rejected_text,
-                "is_identity": False,
-                "domain": "self_distilled",
-                "orig_difficulty": orig_feat.difficulty_score,
-                "target_difficulty": best.difficulty_score,
-                "difficulty_drop": round(drop, 2),
-                "cosine_similarity": best.cosine_similarity,
-                "nli_min_entailment": best.nli_min_entailment,
-                "nli_max_contradiction": contra,
-                "gpt2_perplexity": best.gpt2_perplexity,
-                "code_preservation": best.code_preservation,
-                "length_ratio": lratio,
-                "rejected_objective": rejected_obj,
-            }
-            kept_records.append(record)
-            print(
-                f"[{idx + 1:03d}/{len(corpus)}] KEPT drop={drop:+.1f} "
-                f"cos={best.cosine_similarity:.3f} nli={best.nli_min_entailment:.3f} "
-                f"contra={contra:.3f} len={lratio:.2f}"
-            )
-        else:
-            print(
-                f"[{idx + 1:03d}/{len(corpus)}] SKIP drop={drop:+.1f} "
-                f"cos={best.cosine_similarity:.3f} nli={best.nli_min_entailment:.3f} "
-                f"contra={contra:.3f} len={lratio:.2f}"
+            keep = (
+                drop >= 10.0
+                and best.cosine_similarity >= 0.80
+                and best.nli_min_entailment >= 0.72
+                and contra <= 0.10
+                and best.code_preservation >= 1.0
+                and 0.65 <= lratio <= 1.85
             )
 
-        with open(progress_path, "a", encoding="utf-8") as pf:
-            pf.write(json.dumps({"idx": idx, "kept": keep, "record": record}) + "\n")
+            record: dict[str, Any] | None = None
+            if keep:
+                rejected_cand = next((c for c in reversed(ranked[1:]) if c.text != best.text), None)
+                rejected_text = rejected_cand.text if rejected_cand is not None else src
+                rejected_obj = rejected_cand.objective if rejected_cand is not None else None
+                record = {
+                    "id": f"train_{idx:03d}",
+                    "source": src,
+                    "target": best.text,
+                    "chosen": best.text,
+                    "rejected": rejected_text,
+                    "is_identity": False,
+                    "domain": "self_distilled",
+                    "orig_difficulty": orig_feat.difficulty_score,
+                    "target_difficulty": best.difficulty_score,
+                    "difficulty_drop": round(drop, 2),
+                    "cosine_similarity": best.cosine_similarity,
+                    "nli_min_entailment": best.nli_min_entailment,
+                    "nli_max_contradiction": contra,
+                    "gpt2_perplexity": best.gpt2_perplexity,
+                    "code_preservation": best.code_preservation,
+                    "length_ratio": lratio,
+                    "rejected_objective": rejected_obj,
+                }
+                kept_records.append(record)
+                print(
+                    f"[{idx + 1:03d}/{len(corpus)}] KEPT drop={drop:+.1f} "
+                    f"cos={best.cosine_similarity:.3f} nli={best.nli_min_entailment:.3f} "
+                    f"contra={contra:.3f} len={lratio:.2f}"
+                )
+            else:
+                print(
+                    f"[{idx + 1:03d}/{len(corpus)}] SKIP drop={drop:+.1f} "
+                    f"cos={best.cosine_similarity:.3f} nli={best.nli_min_entailment:.3f} "
+                    f"contra={contra:.3f} len={lratio:.2f}"
+                )
 
-        newly_processed += 1
-        if newly_processed % checkpoint_every == 0:
-            with open(out_pairs_path, "w", encoding="utf-8") as f:
-                json.dump(kept_records, f, indent=2)
-            print(f"  [checkpoint] saved {len(kept_records)} kept pairs to {out_pairs_path}")
+            with open(progress_path, "a", encoding="utf-8") as pf:
+                pf.write(json.dumps({"idx": idx, "kept": keep, "record": record}) + "\n")
 
-    teacher.close()
+            newly_processed += 1
+            if newly_processed % checkpoint_every == 0:
+                with open(out_pairs_path, "w", encoding="utf-8") as f:
+                    json.dump(kept_records, f, indent=2)
+                print(f"  [checkpoint] saved {len(kept_records)} kept pairs to {out_pairs_path}")
+
+    finally:
+        if teacher is not None:
+            teacher.close()
+        semantics.close()
     with open(out_pairs_path, "w", encoding="utf-8") as f:
         json.dump(kept_records, f, indent=2)
     return kept_records
@@ -835,7 +938,7 @@ def train_lora_adapter(
     batch_size: int = 2,
     simpo_batch_size: int = 1,
     grad_accum: int = 4,
-    max_length: int = 768,
+    max_length: int = 1024,
     use_4bit: bool = True,
     val_ratio: float = 0.1,
     seed: int = 42,
@@ -1004,8 +1107,9 @@ def train_lora_adapter(
             optimizer.zero_grad(set_to_none=True)
             for step, batch in enumerate(train_loader):
                 batch = {k: v.to(device) for k, v in batch.items()}
-                out = model(**batch)
-                loss = out.loss / grad_accum
+                with _autocast_ctx(device, compute_dtype):
+                    out = model(**batch)
+                    loss = out.loss / grad_accum
                 loss.backward()
                 ep_loss += out.loss.item()
                 if (step + 1) % grad_accum == 0 or (step + 1) == len(train_loader):
@@ -1016,7 +1120,7 @@ def train_lora_adapter(
 
             avg_train = ep_loss / max(len(train_loader), 1)
             has_val = len(val_loader) > 0
-            avg_val = _eval_sft_loss(model, val_loader, device) if has_val else avg_train
+            avg_val = _eval_sft_loss(model, val_loader, device, compute_dtype=compute_dtype) if has_val else avg_train
             selection_metric = avg_val if has_val else avg_train
             is_best = selection_metric < best_sft_loss
             if is_best:
@@ -1096,25 +1200,26 @@ def train_lora_adapter(
                 pref_opt.zero_grad(set_to_none=True)
                 for step, batch in enumerate(pref_train_loader):
                     batch = {k: v.to(device) for k, v in batch.items()}
-                    c_logp = _sequence_avg_logp(
-                        model,
-                        batch["chosen_input_ids"],
-                        batch["chosen_attention_mask"],
-                        batch["chosen_labels"],
-                    )
-                    r_logp = _sequence_avg_logp(
-                        model,
-                        batch["rejected_input_ids"],
-                        batch["rejected_attention_mask"],
-                        batch["rejected_labels"],
-                    )
-                    metrics = compute_simpo_loss(
-                        c_logp,
-                        r_logp,
-                        beta=simpo_beta,
-                        gamma=simpo_gamma,
-                        sft_anchor_weight=sft_anchor_weight,
-                    )
+                    with _autocast_ctx(device, compute_dtype):
+                        c_logp = _sequence_avg_logp(
+                            model,
+                            batch["chosen_input_ids"],
+                            batch["chosen_attention_mask"],
+                            batch["chosen_labels"],
+                        )
+                        r_logp = _sequence_avg_logp(
+                            model,
+                            batch["rejected_input_ids"],
+                            batch["rejected_attention_mask"],
+                            batch["rejected_labels"],
+                        )
+                        metrics = compute_simpo_loss(
+                            c_logp,
+                            r_logp,
+                            beta=simpo_beta,
+                            gamma=simpo_gamma,
+                            sft_anchor_weight=sft_anchor_weight,
+                        )
                     (metrics["loss"] / grad_accum).backward()
                     ep_loss += metrics["loss"].item()
                     ep_margin += metrics["margin"].item()
@@ -1138,6 +1243,7 @@ def train_lora_adapter(
                         simpo_beta,
                         simpo_gamma,
                         sft_anchor_weight,
+                        compute_dtype=compute_dtype,
                     )
                 else:
                     val_loss, val_margin, val_acc = avg_loss, avg_margin, avg_acc
@@ -1318,7 +1424,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=2, help="Per-device batch size for SFT.")
     parser.add_argument("--simpo-batch-size", type=int, default=1, help="Per-device batch size for SimPO.")
     parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps.")
-    parser.add_argument("--max-length", type=int, default=768, help="Maximum sequence length in tokens.")
+    parser.add_argument("--max-length", type=int, default=1024, help="Maximum sequence length in tokens.")
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation split ratio.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for splitting and training.")
     parser.add_argument(

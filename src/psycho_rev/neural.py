@@ -12,6 +12,7 @@ Implements six inference pipelines:
 from __future__ import annotations
 
 import gc
+import inspect
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -127,6 +128,7 @@ class OpenAICompatibleReverser:
         self._analyzer = analyzer
         self.fallback_on_code_loss = fallback_on_code_loss
         self.max_chunk_chars = max_chunk_chars
+        self.last_skipped_as_clear: bool = False
 
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=httpx.Timeout(timeout))
@@ -244,10 +246,11 @@ class OpenAICompatibleReverser:
                 deduped.append(cleaned)
         return deduped or [text]
 
-    def _rewrite_chunk(self, text: str) -> str:
+    def _rewrite_chunk(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
         if not text.strip():
             return text
-        if self.skip_if_clear and is_already_clear(
+        if effective_skip and is_already_clear(
             text, self._get_analyzer(), threshold=self.clear_difficulty_threshold
         ):
             return text
@@ -270,26 +273,51 @@ class OpenAICompatibleReverser:
 
         return result or text
 
-    def rewrite(self, text: str) -> str:
-        return rewrite_markdown_preserving_structure(
+    def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        self.last_skipped_as_clear = False
+        if not text or not text.strip():
+            self.last_skipped_as_clear = effective_skip
+            return text
+
+        rewritable_chunks = 0
+        skipped_chunks = 0
+
+        def _chunk(chunk_text: str) -> str:
+            nonlocal rewritable_chunks, skipped_chunks
+            if not chunk_text.strip():
+                return chunk_text
+            rewritable_chunks += 1
+            if effective_skip and is_already_clear(
+                chunk_text, self._get_analyzer(), threshold=self.clear_difficulty_threshold
+            ):
+                skipped_chunks += 1
+                return chunk_text
+            return self._rewrite_chunk(chunk_text, skip_if_clear=False)
+
+        result = rewrite_markdown_preserving_structure(
             text,
-            self._rewrite_chunk,
+            _chunk,
             max_chunk_chars=self.max_chunk_chars,
         )
+        self.last_skipped_as_clear = rewritable_chunks > 0 and skipped_chunks == rewritable_chunks
+        return result
 
     def rewrite_batch(
         self,
         texts: list[str],
         max_concurrency: int | None = None,
+        *,
+        skip_if_clear: bool | None = None,
     ) -> list[str]:
         """Rewrite a list of documents concurrently while preserving input order."""
         if not texts:
             return []
         workers = max(1, int(max_concurrency or self.max_concurrency))
         if workers == 1 or len(texts) == 1:
-            return [self.rewrite(t) for t in texts]
+            return [self.rewrite(t, skip_if_clear=skip_if_clear) for t in texts]
         with ThreadPoolExecutor(max_workers=min(workers, len(texts))) as pool:
-            return list(pool.map(self.rewrite, texts))
+            return list(pool.map(lambda t: self.rewrite(t, skip_if_clear=skip_if_clear), texts))
 
     def close(self) -> None:
         if self._owns_client and self._client is not None:
@@ -377,6 +405,7 @@ class QwenZeroShotReverser:
         self.skip_if_clear = skip_if_clear
         self.clear_difficulty_threshold = float(clear_difficulty_threshold)
         self._analyzer = analyzer
+        self.last_skipped_as_clear: bool = False
         dtype = (
             torch.bfloat16
             if self.device == "cuda" and torch.cuda.is_bf16_supported()
@@ -463,15 +492,39 @@ class QwenZeroShotReverser:
                 deduped.append(r)
         return deduped or [text]
 
-    def _rewrite_chunk(self, text: str) -> str:
-        if self.skip_if_clear and is_already_clear(
+    def _rewrite_chunk(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        if effective_skip and is_already_clear(
             text, self._get_analyzer(), threshold=self.clear_difficulty_threshold
         ):
             return text
         return self.generate_candidates(text, num_samples=1, include_greedy=True)[0]
 
-    def rewrite(self, text: str) -> str:
-        return rewrite_markdown_preserving_structure(text, self._rewrite_chunk)
+    def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        self.last_skipped_as_clear = False
+        if not text or not text.strip():
+            self.last_skipped_as_clear = effective_skip
+            return text
+
+        rewritable_chunks = 0
+        skipped_chunks = 0
+
+        def _chunk(chunk_text: str) -> str:
+            nonlocal rewritable_chunks, skipped_chunks
+            if not chunk_text.strip():
+                return chunk_text
+            rewritable_chunks += 1
+            if effective_skip and is_already_clear(
+                chunk_text, self._get_analyzer(), threshold=self.clear_difficulty_threshold
+            ):
+                skipped_chunks += 1
+                return chunk_text
+            return self._rewrite_chunk(chunk_text, skip_if_clear=False)
+
+        result = rewrite_markdown_preserving_structure(text, _chunk)
+        self.last_skipped_as_clear = rewritable_chunks > 0 and skipped_chunks == rewritable_chunks
+        return result
 
     def close(self) -> None:
         import torch
@@ -525,6 +578,7 @@ class BestOfNPsycholinguisticReverser:
         self.max_contradiction = float(max_contradiction)
         self.skip_if_clear = skip_if_clear
         self.clear_difficulty_threshold = float(clear_difficulty_threshold)
+        self.last_skipped_as_clear: bool = False
 
     def _get_classical_fallback(self) -> ClassicalReverser:
         if self._classical_fallback is None:
@@ -636,15 +690,39 @@ class BestOfNPsycholinguisticReverser:
     def rewrite_ranked(self, text: str) -> RankedCandidate:
         return self.rewrite_ranked_all(text)[0]
 
-    def _rewrite_chunk(self, text: str) -> str:
-        if self.skip_if_clear and is_already_clear(
+    def _rewrite_chunk(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        if effective_skip and is_already_clear(
             text, self.analyzer, threshold=self.clear_difficulty_threshold
         ):
             return text
         return self.rewrite_ranked(text).text
 
-    def rewrite(self, text: str) -> str:
-        return rewrite_markdown_preserving_structure(text, self._rewrite_chunk)
+    def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        self.last_skipped_as_clear = False
+        if not text or not text.strip():
+            self.last_skipped_as_clear = effective_skip
+            return text
+
+        rewritable_chunks = 0
+        skipped_chunks = 0
+
+        def _chunk(chunk_text: str) -> str:
+            nonlocal rewritable_chunks, skipped_chunks
+            if not chunk_text.strip():
+                return chunk_text
+            rewritable_chunks += 1
+            if effective_skip and is_already_clear(
+                chunk_text, self.analyzer, threshold=self.clear_difficulty_threshold
+            ):
+                skipped_chunks += 1
+                return chunk_text
+            return self._rewrite_chunk(chunk_text, skip_if_clear=False)
+
+        result = rewrite_markdown_preserving_structure(text, _chunk)
+        self.last_skipped_as_clear = rewritable_chunks > 0 and skipped_chunks == rewritable_chunks
+        return result
 
 
 class LoRASinglePassReverser:
@@ -681,6 +759,7 @@ class LoRASinglePassReverser:
         self.skip_if_clear = skip_if_clear
         self.clear_difficulty_threshold = float(clear_difficulty_threshold)
         self._analyzer = analyzer
+        self.last_skipped_as_clear: bool = False
 
         dtype = (
             torch.bfloat16
@@ -714,10 +793,11 @@ class LoRASinglePassReverser:
             self._classical_fallback = ClassicalReverser(safe_mode=True)
         return self._classical_fallback
 
-    def _rewrite_chunk(self, text: str) -> str:
+    def _rewrite_chunk(self, text: str, *, skip_if_clear: bool | None = None) -> str:
         import torch
 
-        if self.skip_if_clear and is_already_clear(
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        if effective_skip and is_already_clear(
             text, self._get_analyzer(), threshold=self.clear_difficulty_threshold
         ):
             return text
@@ -768,8 +848,31 @@ class LoRASinglePassReverser:
 
         return result or text
 
-    def rewrite(self, text: str) -> str:
-        return rewrite_markdown_preserving_structure(text, self._rewrite_chunk)
+    def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        self.last_skipped_as_clear = False
+        if not text or not text.strip():
+            self.last_skipped_as_clear = effective_skip
+            return text
+
+        rewritable_chunks = 0
+        skipped_chunks = 0
+
+        def _chunk(chunk_text: str) -> str:
+            nonlocal rewritable_chunks, skipped_chunks
+            if not chunk_text.strip():
+                return chunk_text
+            rewritable_chunks += 1
+            if effective_skip and is_already_clear(
+                chunk_text, self._get_analyzer(), threshold=self.clear_difficulty_threshold
+            ):
+                skipped_chunks += 1
+                return chunk_text
+            return self._rewrite_chunk(chunk_text, skip_if_clear=False)
+
+        result = rewrite_markdown_preserving_structure(text, _chunk)
+        self.last_skipped_as_clear = rewritable_chunks > 0 and skipped_chunks == rewritable_chunks
+        return result
 
     def close(self) -> None:
         import torch
@@ -790,6 +893,7 @@ class HybridReverser:
         safe_mode: bool = True,
         fluency_gate: Callable[[str], float] | None = None,
         min_fluency_delta: float = -0.05,
+        skip_if_clear: bool | None = None,
     ):
         self.neural = neural
         self.classical = classical or ClassicalReverser(
@@ -797,9 +901,36 @@ class HybridReverser:
             fluency_gate=fluency_gate,
             min_fluency_delta=min_fluency_delta,
         )
+        self.skip_if_clear: bool = (
+            bool(getattr(neural, "skip_if_clear", True))
+            if skip_if_clear is None
+            else bool(skip_if_clear)
+        )
+        self.last_skipped_as_clear: bool = False
 
-    def rewrite(self, text: str) -> str:
-        return self.classical.rewrite(self.neural.rewrite(text))
+    def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+        effective_skip = self.skip_if_clear if skip_if_clear is None else skip_if_clear
+        self.last_skipped_as_clear = False
+
+        rewrite_fn = self.neural.rewrite
+        try:
+            sig = inspect.signature(rewrite_fn)
+            accepts_skip = "skip_if_clear" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_skip = False
+
+        if accepts_skip:
+            neural_out = rewrite_fn(text, skip_if_clear=effective_skip)
+        else:
+            neural_out = rewrite_fn(text)
+
+        if getattr(self.neural, "last_skipped_as_clear", False):
+            self.last_skipped_as_clear = True
+            return neural_out
+
+        return self.classical.rewrite(neural_out)
 
     def close(self) -> None:
         if hasattr(self.neural, "close"):

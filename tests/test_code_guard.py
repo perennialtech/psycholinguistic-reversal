@@ -204,3 +204,53 @@ def test_split_markdown_chunks_preserves_frontmatter_tables_blockquotes_and_resp
     assert not any("title: Runbook" in call for call in seen_calls)
     assert not any("| api | 8080 |" in call for call in seen_calls)
     assert not any("echo $HOME --dry-run" in call for call in seen_calls)
+
+
+def test_protect_spans_avoids_placeholder_collision_with_existing_text():
+    text = "Keep literal CODEITEM0 intact while masking `parse_header()` and store.py."
+    guarded = protect_spans(text)
+    assert "CODEITEM0" in guarded.masked
+    assert all(k.startswith("CODEITEMX0_") for k in guarded.placeholders)
+    assert guarded.restore(guarded.masked) == text
+
+    text2 = "Mention CODEITEM0 and CODEITEMX0_0 alongside `run()`."
+    guarded2 = protect_spans(text2)
+    assert "CODEITEM0" in guarded2.masked
+    assert "CODEITEMX0_0" in guarded2.masked
+    assert all(k.startswith("CODEITEMX1_") for k in guarded2.placeholders)
+    assert guarded2.restore(guarded2.masked) == text2
+
+
+def test_restore_spans_single_pass_prevents_chained_replacement():
+    mapping = {
+        "CODEITEM0": "literal CODEITEM1 value",
+        "CODEITEM1": "REPLACED_SECOND",
+    }
+    restored = restore_spans("CODEITEM0 and CODEITEM1", mapping)
+    assert restored == "literal CODEITEM1 value and REPLACED_SECOND"
+    assert restore_spans("unchanged prose", {}) == "unchanged prose"
+
+
+def test_prose_slash_pairs_case_insensitive():
+    text = (
+        "Choose And/or, Yes/No, True/False, Input/Output, and Client/Server options "
+        "in src/cache/store.py."
+    )
+    guarded = protect_spans(text)
+    for pair in ("And/or", "Yes/No", "True/False", "Input/Output", "Client/Server"):
+        assert pair in guarded.masked
+    assert "src/cache/store.py" not in guarded.masked
+    assert guarded.restore(guarded.masked) == text
+
+
+def test_single_letter_extensions_not_masked_in_prose_but_masked_with_slash():
+    text = (
+        "See Section 2.c, Appendix A.h, clause 3.r, and Table 1.R; "
+        "edit src/main.c, ./include/header.h, and scripts/plot.R."
+    )
+    guarded = protect_spans(text)
+    for prose_ref in ("Section 2.c", "Appendix A.h", "clause 3.r", "Table 1.R"):
+        assert prose_ref in guarded.masked
+    for path_ref in ("src/main.c", "./include/header.h", "scripts/plot.R"):
+        assert path_ref not in guarded.masked
+    assert guarded.restore(guarded.masked) == text

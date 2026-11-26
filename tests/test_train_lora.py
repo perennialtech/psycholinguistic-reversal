@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from psycho_rev.code_guard import protect_spans
 from psycho_rev.neural import REWRITE_SYSTEM_PROMPT
 from psycho_rev.train_lora import (
     PreferenceDataset,
@@ -302,6 +303,25 @@ def test_truncation_and_length_ratio_helpers() -> None:
     assert is_truncated_text("The server handles incoming requests cleanly.", "The server handles incoming requests well.") is False
 
 
+def test_filter_checks_code_preservation_rate_metadata_key() -> None:
+    records = [
+        {
+            "source": "This sentence has plain words only.",
+            "target": "This sentence uses plain words only.",
+            "code_preservation_rate": 0.5,
+        },
+        {
+            "source": "Another plain sentence stays intact.",
+            "target": "Another plain sentence remains intact.",
+            "code_preservation_rate": 1.0,
+        },
+    ]
+    kept, stats = filter_distilled_records(records, include_builtin_identity=False)
+    assert stats["rejected_code_preservation"] == 1
+    assert len(kept) == 1
+    assert kept[0]["source"] == "Another plain sentence stays intact."
+
+
 # ---------------------------------------------------------------------------
 # 3. Deterministic train/val split & hard-negative preference triples
 # ---------------------------------------------------------------------------
@@ -388,6 +408,109 @@ def test_format_rewrite_messages_uses_canonical_system_prompt_and_code_guard() -
     assert "store.py" not in msgs[2]["content"]
     assert "CODEITEM0" in msgs[1]["content"] and "CODEITEM0" in msgs[2]["content"]
     assert "CODEITEM1" in msgs[1]["content"] and "CODEITEM1" in msgs[2]["content"]
+
+
+def test_format_rewrite_messages_preserves_duplicate_code_spans_and_identity() -> None:
+    src = "Call `foo()` first, then call `foo()` again."
+    tgt = "First invoke `foo()`, then invoke `foo()` again."
+    guarded = protect_spans(src)
+
+    msgs = format_rewrite_messages(src, tgt)
+    assert "CODEITEM0" in msgs[1]["content"] and "CODEITEM1" in msgs[1]["content"]
+    assert "CODEITEM0" in msgs[2]["content"] and "CODEITEM1" in msgs[2]["content"]
+    assert msgs[2]["content"].count("CODEITEM0") == 1
+    assert msgs[2]["content"].count("CODEITEM1") == 1
+    assert guarded.restore(msgs[2]["content"]) == tgt
+
+    # Identity pair maps directly to g_src.masked
+    id_msgs = format_rewrite_messages(src, src)
+    assert id_msgs[2]["content"] == guarded.masked
+    assert "CODEITEM0" in id_msgs[2]["content"] and "CODEITEM1" in id_msgs[2]["content"]
+
+
+class _EOSDummyChatTokenizer(_DummyChatTokenizer):
+    """Dummy chat tokenizer that appends an explicit EOS token to complete assistant turns."""
+
+    eos_token_id = 4
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._vocab["<eos>"] = 4
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = True,
+        add_generation_prompt: bool = False,
+    ) -> list[int] | str:
+        out = super().apply_chat_template(
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+        )
+        if not tokenize:
+            return out if add_generation_prompt else f"{out} <eos>"
+        assert isinstance(out, list)
+        if not add_generation_prompt:
+            return out + [self.eos_token_id]
+        return out
+
+
+def test_encode_pair_never_emits_truncated_eos_and_splits_multipara() -> None:
+    tok = _EOSDummyChatTokenizer()
+    src = "The service processes incoming webhook events sequentially."
+    tgt = "The service handles incoming webhook events one at a time."
+
+    full_enc = encode_pair(src, tgt, tok, max_len=512)
+    assert full_enc is not None
+    full_len = len(full_enc["input_ids"])
+    assert full_enc["input_ids"][-1].item() == tok.eos_token_id
+    assert full_enc["labels"][-1].item() == tok.eos_token_id
+
+    # Even 1 token shorter than full_len would drop EOS, so encode_pair must return None
+    assert encode_pair(src, tgt, tok, max_len=full_len - 1) is None
+
+    sft_dropped = SFTDataset([(src, tgt)], tok, max_len=full_len - 1)
+    assert len(sft_dropped) == 0
+    assert sft_dropped.dropped_truncated == 1
+
+    pref_dropped = PreferenceDataset([(src, tgt, "Clunky rewrite here.")], tok, max_len=full_len - 1)
+    assert len(pref_dropped) == 0
+    assert pref_dropped.dropped_truncated == 1
+
+    # Multi-paragraph aligned pair exceeding max_len as a whole doc splits into paragraph pairs with intact EOS
+    p1_src = "First paragraph describes how the worker drains queued jobs."
+    p1_tgt = "First paragraph explains how the worker handles queued jobs."
+    p1_rej = "First paragraph bloatedly describes queued job draining."
+    p2_src = "Second paragraph explains why retries use exponential backoff."
+    p2_tgt = "Second paragraph shows why retries use exponential backoff."
+    p2_rej = "Second paragraph awkwardly discusses retry timing."
+
+    whole_src = f"{p1_src}\n\n{p2_src}"
+    whole_tgt = f"{p1_tgt}\n\n{p2_tgt}"
+    whole_rej = f"{p1_rej}\n\n{p2_rej}"
+
+    p1_len = len(encode_pair(p1_src, p1_tgt, tok, max_len=512)["input_ids"])
+    p2_len = len(encode_pair(p2_src, p2_tgt, tok, max_len=512)["input_ids"])
+    whole_len = len(encode_pair(whole_src, whole_tgt, tok, max_len=512)["input_ids"])
+    split_cap = max(p1_len, p2_len) + 2
+    assert split_cap < whole_len
+
+    sft_split = SFTDataset([(whole_src, whole_tgt)], tok, max_len=split_cap)
+    assert len(sft_split) == 2
+    assert sft_split.split_multipara_docs == 1
+    assert sft_split.dropped_truncated == 0
+    for item in sft_split.items:
+        assert item["input_ids"][-1].item() == tok.eos_token_id
+        assert item["labels"][-1].item() == tok.eos_token_id
+
+    pref_split = PreferenceDataset([(whole_src, whole_tgt, whole_rej)], tok, max_len=split_cap)
+    assert len(pref_split) == 2
+    assert pref_split.split_multipara_docs == 1
+    assert pref_split.dropped_truncated == 0
+    for item in pref_split.items:
+        assert item["chosen_input_ids"][-1].item() == tok.eos_token_id
+        assert item["rejected_input_ids"][-1].item() == tok.eos_token_id
 
 
 def test_encode_pair_masks_prompt_and_collates_cleanly() -> None:
@@ -559,7 +682,7 @@ def test_cli_arg_parser_flags_and_defaults() -> None:
     assert defaults.val_ratio == pytest.approx(0.1)
     assert defaults.seed == 42
     assert defaults.identity_ratio == pytest.approx(0.15)
-    assert defaults.max_length == 768
+    assert defaults.max_length == 1024
     assert defaults.push_to_hub is None
     assert defaults.resume_from_checkpoint is None
 

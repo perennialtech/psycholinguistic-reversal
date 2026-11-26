@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -27,6 +28,8 @@ class _PayloadError(Exception):
 
 
 def _make_handler(rewriter: Rewriter, max_body_bytes: int) -> type[BaseHTTPRequestHandler]:
+    rewriter_lock = threading.Lock()
+
     class PsychoRevHandler(BaseHTTPRequestHandler):
         server_version = "PsychoRevHTTP/0.2"
 
@@ -115,7 +118,8 @@ def _make_handler(rewriter: Rewriter, max_body_bytes: int) -> type[BaseHTTPReque
                     raise _PayloadError("Field 'text' is required and must be a string.")
 
                 if path == "/analyze":
-                    report = rewriter.analyze(text)
+                    with rewriter_lock:
+                        report = rewriter.analyze(text)
                     data = report.to_dict() if hasattr(report, "to_dict") else dict(report)
                     self._send_json(HTTPStatus.OK, data)
                     return
@@ -124,7 +128,8 @@ def _make_handler(rewriter: Rewriter, max_body_bytes: int) -> type[BaseHTTPReque
                 if skip_if_clear is not None and not isinstance(skip_if_clear, bool):
                     raise _PayloadError("Field 'skip_if_clear' must be a boolean if provided.")
 
-                result = rewriter.rewrite(text, skip_if_clear=skip_if_clear)
+                with rewriter_lock:
+                    result = rewriter.rewrite(text, skip_if_clear=skip_if_clear)
                 self._send_json(HTTPStatus.OK, result.to_dict())
             except _PayloadError as exc:
                 self._send_json(exc.status, {"error": str(exc)})

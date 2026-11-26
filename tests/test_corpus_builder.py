@@ -624,6 +624,99 @@ def test_distill_training_pairs_hard_negatives_identity_and_resume(tmp_path: Pat
     assert len(api_calls) == prev_calls
 
 
+
+
+def test_distill_training_pairs_retries_and_skips_unparseable_json(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    samples = [
+        DatasetSample(
+            sample_id="flaky_json_sample",
+            domain="coding",
+            text="The worker swallows `TimeoutError` during shutdown.",
+            source_model="openai/gpt-4o-mini",
+            split="train",
+            is_out_of_lexicon=False,
+        ),
+        DatasetSample(
+            sample_id="always_broken_json_sample",
+            domain="essay",
+            text="Municipal budgets often lag behind rapid transit expansion.",
+            source_model="openai/gpt-4o-mini",
+            split="train",
+            is_out_of_lexicon=True,
+        ),
+        DatasetSample(
+            sample_id="healthy_sample",
+            domain="technical_docs",
+            text="Set an explicit timeout on every outbound HTTP request.",
+            source_model="openai/gpt-4o-mini",
+            split="train",
+            is_out_of_lexicon=True,
+        ),
+    ]
+
+    attempts: dict[str, int] = {"flaky": 0, "broken": 0, "healthy": 0}
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        user_text = body["messages"][-1]["content"]
+
+        if "TimeoutError" in user_text:
+            attempts["flaky"] += 1
+            if attempts["flaky"] == 1:
+                return httpx.Response(200, json=_mock_chat_response(""))
+            if attempts["flaky"] == 2:
+                return httpx.Response(200, json=_mock_chat_response("not valid json at all"))
+            payload = {
+                "needs_edit": True,
+                "chosen": "The worker ignores `TimeoutError` during shutdown.",
+                "over_edited": "The entire worker crashes during shutdown.",
+                "clunky_literal": "The worker fails to process `TimeoutError` at shutdown time.",
+            }
+            return httpx.Response(200, json=_mock_chat_response(json.dumps(payload)))
+
+        if "Municipal budgets" in user_text:
+            attempts["broken"] += 1
+            bad_outputs = ["", "still not json", "[1, 2, 3]"]
+            raw = bad_outputs[min(attempts["broken"] - 1, len(bad_outputs) - 1)]
+            return httpx.Response(200, json=_mock_chat_response(raw))
+
+        attempts["healthy"] += 1
+        payload = {
+            "needs_edit": False,
+            "chosen": user_text,
+            "over_edited": "Always ensure that outbound HTTP requests utilize strictly defined timeout thresholds.",
+            "clunky_literal": "",
+        }
+        return httpx.Response(200, json=_mock_chat_response(json.dumps(payload)))
+
+    with caplog.at_level("WARNING", logger="psycho_rev.corpus_builder"):
+        with LLMClient(
+            provider="openrouter",
+            api_key="sk-mock",
+            transport=httpx.MockTransport(handler),
+            sleep_fn=sleeps.append,
+        ) as client:
+            pairs = distill_training_pairs(
+                samples,
+                output_dir=tmp_path,
+                teacher_model="anthropic/claude-3.5-sonnet",
+                resume=False,
+                max_workers=1,
+                llm_client=client,
+            )
+
+    assert attempts["flaky"] == 3
+    assert attempts["broken"] == 3
+    assert attempts["healthy"] == 1
+    # 2 retries for flaky + 2 retries for broken = 4 backoff sleeps
+    assert len(sleeps) == 4
+    assert {p.sample_id for p in pairs} == {"flaky_json_sample", "healthy_sample"}
+    assert any("always_broken_json_sample" in rec.message for rec in caplog.records)
+
+
 def test_cli_arg_parser_smoke():
     parser = build_arg_parser()
     gen_args = parser.parse_args(

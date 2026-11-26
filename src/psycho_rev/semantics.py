@@ -16,8 +16,17 @@ from psycho_rev.code_guard import code_preservation_rate, protect_spans
 logger = logging.getLogger(__name__)
 
 _FENCED_CODE_RE = re.compile(r"```[\s\S]*?```|~~~[\s\S]*?~~~", re.MULTILINE)
+_YAML_FRONTMATTER_RE = re.compile(r"\A[ \t]*\n*---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|\Z)")
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_MD_HEADING_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.*)$")
+_MD_LIST_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(.*)$")
+_MD_BLOCKQUOTE_RE = re.compile(r"^[ \t]*>[ \t]?(.*)$")
+_MD_TABLE_LINE_RE = re.compile(r"^[ \t]*\|.*$")
+_MD_TABLE_SEP_RE = re.compile(
+    r"^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|?[ \t]*$"
+)
+_MD_THEMATIC_BREAK_RE = re.compile(r"^[ \t]*(?:[-*_][ \t]*){3,}$")
 _MD_PREFIX_RE = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+|(?:[-*+]|\d+[.)])[ \t]+|>[ \t]*)")
 _ALPHA_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -216,19 +225,92 @@ def strip_fenced_code(text: str) -> str:
 def split_prose_sentences(text: str) -> list[str]:
     """Extract clean prose sentences for sentence-level grammatical acceptability scoring.
 
-    Removes fenced code blocks, strips leading markdown list/heading/blockquote prefixes,
-    masks inline code spans and technical identifiers, and splits on sentence boundaries.
+    Strips YAML frontmatter, fenced code blocks, Markdown pipe tables, and leading
+    heading/list/blockquote markers; joins soft-wrapped prose lines within the same
+    paragraph; masks inline code spans and technical identifiers; and splits on
+    sentence boundaries.
     """
-    prose = strip_fenced_code(text)
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    normalized = _YAML_FRONTMATTER_RE.sub("", normalized, count=1)
+    prose = _FENCED_CODE_RE.sub("\n\n", normalized).strip()
     if not prose:
         return []
 
-    sentences: list[str] = []
+    blocks: list[str] = []
+    para_lines: list[str] = []
+    in_blockquote = False
+
+    def _flush_para() -> None:
+        if para_lines:
+            blocks.append(" ".join(para_lines))
+            para_lines.clear()
+
     for raw_line in prose.splitlines():
-        line = _MD_PREFIX_RE.sub("", raw_line).strip()
-        if not line:
+        if not raw_line.strip():
+            _flush_para()
+            in_blockquote = False
             continue
-        masked = protect_spans(line).masked
+
+        if _MD_TABLE_LINE_RE.match(raw_line) or _MD_TABLE_SEP_RE.match(raw_line):
+            _flush_para()
+            in_blockquote = False
+            continue
+
+        if _MD_THEMATIC_BREAK_RE.match(raw_line):
+            _flush_para()
+            in_blockquote = False
+            continue
+
+        heading_match = _MD_HEADING_RE.match(raw_line)
+        if heading_match:
+            _flush_para()
+            in_blockquote = False
+            heading_text = re.sub(r"[ \t]+#+[ \t]*$", "", heading_match.group(1)).strip()
+            if heading_text:
+                blocks.append(heading_text)
+            continue
+
+        bq_match = _MD_BLOCKQUOTE_RE.match(raw_line)
+        if bq_match:
+            if not in_blockquote:
+                _flush_para()
+                in_blockquote = True
+            inner = bq_match.group(1).strip()
+            if not inner:
+                _flush_para()
+                continue
+            if _MD_TABLE_LINE_RE.match(inner) or _MD_TABLE_SEP_RE.match(inner):
+                _flush_para()
+                continue
+            list_match = _MD_LIST_RE.match(inner)
+            if list_match:
+                _flush_para()
+                item_text = list_match.group(1).strip()
+                if item_text:
+                    para_lines.append(item_text)
+            else:
+                para_lines.append(inner)
+            continue
+
+        if in_blockquote:
+            _flush_para()
+            in_blockquote = False
+
+        list_match = _MD_LIST_RE.match(raw_line)
+        if list_match:
+            _flush_para()
+            item_text = list_match.group(1).strip()
+            if item_text:
+                para_lines.append(item_text)
+            continue
+
+        para_lines.append(raw_line.strip())
+
+    _flush_para()
+
+    sentences: list[str] = []
+    for block in blocks:
+        masked = protect_spans(block).masked
         for part in _SENT_SPLIT_RE.split(masked):
             sent = part.strip()
             if not sent:

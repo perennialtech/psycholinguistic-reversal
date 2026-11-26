@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import logging
 import os
 import random
 import re
@@ -37,6 +38,8 @@ from psycho_rev.datasets import (
     save_jsonl,
 )
 from psycho_rev.features import DENOMINAL_SURFACE_TO_LEMMA
+
+logger = logging.getLogger(__name__)
 
 DOMAINS: tuple[str, ...] = ("coding", "technical_docs", "essay", "workplace_chat")
 
@@ -1204,19 +1207,51 @@ def distill_training_pairs(
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": sample.text},
         ]
-        try:
-            resp = client.complete(
-                teacher_model,
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-            )
-        except BudgetExceededError:
-            stop_event.set()
-            return None
+        max_parse_retries = 2
+        resp: LLMResponse | None = None
+        parsed: dict[str, Any] | None = None
+        last_parse_err: Exception | None = None
+        sleep_fn = getattr(client, "_sleep_fn", time.sleep)
+        for attempt in range(max_parse_retries + 1):
+            if stop_event.is_set():
+                return None
+            try:
+                resp = client.complete(
+                    teacher_model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"},
+                )
+            except BudgetExceededError:
+                stop_event.set()
+                return None
 
-        parsed = _extract_json_object(resp.content)
+            try:
+                parsed = _extract_json_object(resp.content)
+                break
+            except (json.JSONDecodeError, ValueError) as exc:
+                last_parse_err = exc
+                if attempt < max_parse_retries:
+                    delay = min(0.5 * (2**attempt), 2.0)
+                    logger.warning(
+                        "Failed to parse JSON response for %s (attempt %d/%d): %s; retrying in %.2fs",
+                        sample.sample_id,
+                        attempt + 1,
+                        max_parse_retries + 1,
+                        exc,
+                        delay,
+                    )
+                    sleep_fn(delay)
+
+        if parsed is None or resp is None:
+            logger.warning(
+                "Skipping %s after %d unparseable JSON responses: %s",
+                sample.sample_id,
+                max_parse_retries + 1,
+                last_parse_err,
+            )
+            return None
         over_edited = str(parsed.get("over_edited") or "").strip()
         clunky_literal = str(parsed.get("clunky_literal") or "").strip()
 

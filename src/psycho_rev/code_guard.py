@@ -7,16 +7,16 @@ from dataclasses import dataclass
 from typing import Callable
 
 _CODE_EXTENSIONS = (
-    "py|pyi|pyx|js|mjs|cjs|ts|tsx|jsx|rs|go|c|h|cc|cpp|cxx|hpp|hh|"
+    "py|pyi|pyx|js|mjs|cjs|ts|tsx|jsx|rs|go|cc|cpp|cxx|hpp|hh|"
     "java|kt|kts|scala|rb|php|pl|sh|bash|zsh|fish|ps1|bat|cmd|cs|fs|"
-    "swift|dart|lua|r|R|jl|ex|exs|erl|hs|ml|zig|nim|sql|html|htm|css|"
+    "swift|dart|lua|jl|ex|exs|erl|hs|ml|zig|nim|sql|html|htm|css|"
     "scss|sass|less|xml|json|jsonc|jsonl|yaml|yml|toml|ini|cfg|conf|"
     "env|lock|md|rst|tex|csv|tsv|proto|graphql|gql|tf|hcl|nix|mk|"
     "cmake|gradle|txt|log"
 )
 
 _PROSE_SLASH_NEG = (
-    r"(?!(?:and|or|yes|no|on|off|he|she|his|her|him|either|neither|"
+    r"(?!(?i:and|or|yes|no|on|off|he|she|his|her|him|either|neither|"
     r"true|false|in|out|up|down|input|output|read|write|client|server|"
     r"before|after|pros|cons)/)"
 )
@@ -99,13 +99,15 @@ class MarkdownChunk:
 
 
 def restore_spans(rewritten: str, guarded: GuardedText | dict[str, str]) -> str:
-    """Restore placeholder tokens back to their original protected spans."""
+    """Restore placeholder tokens back to their original protected spans in a single pass."""
     placeholders = guarded.placeholders if isinstance(guarded, GuardedText) else guarded
-    out = rewritten
-    # Restore longer placeholder keys first (e.g. CODEITEM10 before CODEITEM1)
-    for token in sorted(placeholders, key=len, reverse=True):
-        out = out.replace(token, placeholders[token])
-    return out
+    if not placeholders:
+        return rewritten
+    # Match longer placeholder keys first (e.g. CODEITEM10 before CODEITEM1) in one pass
+    pattern = re.compile(
+        "|".join(re.escape(k) for k in sorted(placeholders, key=len, reverse=True))
+    )
+    return pattern.sub(lambda m: placeholders[m.group(0)], rewritten)
 
 
 def strip_fenced_code_blocks(text: str) -> str:
@@ -113,15 +115,26 @@ def strip_fenced_code_blocks(text: str) -> str:
     return re.sub(r"```[\s\S]*?```|~~~[\s\S]*?~~~", "", text)
 
 
+def _select_placeholder_prefix(text: str) -> str:
+    """Return a placeholder prefix guaranteed not to appear anywhere in *text*."""
+    if "CODEITEM" not in text:
+        return "CODEITEM"
+    suffix_idx = 0
+    while f"CODEITEMX{suffix_idx}_" in text:
+        suffix_idx += 1
+    return f"CODEITEMX{suffix_idx}_"
+
+
 def protect_spans(text: str) -> GuardedText:
     """Replace frontmatter, code spans, fenced blocks, link URLs, HTML/XML tags, CLI flags, env vars, URLs, paths, and identifiers with placeholders."""
+    prefix = _select_placeholder_prefix(text)
     placeholders: dict[str, str] = {}
     counter = 0
 
     def _repl(match: re.Match[str]) -> str:
         nonlocal counter
         original = match.group(0)
-        key = f"CODEITEM{counter}"
+        key = f"{prefix}{counter}"
         counter += 1
         placeholders[key] = original
         return key

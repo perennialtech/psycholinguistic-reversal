@@ -625,3 +625,144 @@ def test_evaluate_jsonl_loader_and_out_of_lexicon_breakdown(tmp_path, monkeypatc
     rendered = "\n".join(md_lines)
     assert "Acc Mean ↑" in rendered and "Acc Min ↑" in rendered
     assert "OOL Acc Min ↑" in rendered
+def test_split_prose_sentences_strips_frontmatter_tables_headings_and_joins_wrapped_lines():
+    markdown_doc = (
+        "---\n"
+        "title: Deployment Guide\n"
+        "owner: platform-team\n"
+        "tags: [ops, rollout]\n"
+        "---\n"
+        "# Service Overview\n\n"
+        "The ingestion pipeline validates incoming payloads\n"
+        "before writing records to durable storage.\n"
+        "Operators monitor queue depth during peak traffic\n"
+        "to avoid cascading timeouts.\n\n"
+        "| Stage | Timeout | Owner |\n"
+        "| :--- | ---: | :--- |\n"
+        "| canary | 60s | sre |\n"
+        "| prod | 120s | core |\n\n"
+        "## Rollback Procedure\n"
+        "Trigger the automated rollback workflow when\n"
+        "error budgets drop below the threshold.\n"
+        "- Verify health checks pass.\n"
+        "- Confirm alert noise subsides."
+    )
+
+    sents = split_prose_sentences(markdown_doc)
+
+    assert all("Deployment Guide" not in s and "platform-team" not in s for s in sents)
+    assert all("|" not in s and "canary" not in s and "60s" not in s for s in sents)
+    assert all(not s.startswith("#") for s in sents)
+    assert sents == [
+        "Service Overview",
+        "The ingestion pipeline validates incoming payloads before writing records to durable storage.",
+        "Operators monitor queue depth during peak traffic to avoid cascading timeouts.",
+        "Rollback Procedure",
+        "Trigger the automated rollback workflow when error budgets drop below the threshold.",
+        "Verify health checks pass.",
+        "Confirm alert noise subsides.",
+    ]
+
+
+def test_evaluate_dynamic_four_domain_summary_and_plot(tmp_path, monkeypatch):
+    for mod_name in ("spacy", "nltk", "nltk.corpus"):
+        if mod_name not in sys.modules:
+            try:
+                __import__(mod_name)
+            except ImportError:
+                stub = ModuleType(mod_name)
+                if mod_name == "nltk.corpus":
+                    stub.brown = None
+                    stub.reuters = None
+                    stub.wordnet = None
+                monkeypatch.setitem(sys.modules, mod_name, stub)
+
+    import matplotlib.pyplot as plt
+    from psycho_rev.evaluate import (
+        _append_domain_table,
+        _plot_comparison,
+        _summarize_by_domain,
+        _summarize_rows,
+    )
+
+    domain_specs = {
+        "coding": (31.5, 0.88, 0.91),
+        "technical_docs": (44.2, 0.84, 0.86),
+        "essay": (27.8, 0.92, 0.95),
+        "workplace_chat": (19.4, 0.89, 0.93),
+    }
+
+    rows_orig = [
+        {
+            "domain": dom,
+            "difficulty_score": diff,
+            "unattested_bigram_rate": 0.2,
+            "trigram_perplexity": 120.0,
+            "mean_dep_length": 2.8,
+            "reduced_orc_per_100w": 1.0,
+            "stacked_noun_per_100w": 2.0,
+            "denominal_verb_per_100w": 0.5,
+            "inanimate_subj_per_100w": 0.5,
+            "cosine_similarity": 0.95,
+            "nli_min_entailment": nli,
+            "nli_max_contradiction": 0.02,
+            "gpt2_perplexity": 28.0,
+            "acceptability_score": acc_min,
+            "acceptability_mean": acc_min + 0.02,
+            "acceptability_min": acc_min,
+            "code_preservation": 1.0,
+            "length_ratio": 1.0,
+            "latency_ms": 10.0,
+        }
+        for dom, (diff, nli, acc_min) in domain_specs.items()
+    ]
+
+    summary_dense = [{"method": "Original", **_summarize_rows(rows_orig)}]
+    domain_breakdowns = [{"method": "Original", **_summarize_by_domain(rows_orig)}]
+
+    md_lines: list[str] = []
+    _append_domain_table(md_lines, "### Per-Domain Breakdown", domain_breakdowns)
+    summary_path = tmp_path / "summary.md"
+    summary_path.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    rendered = summary_path.read_text(encoding="utf-8")
+
+    assert "Chat Diff ↓" not in rendered
+    for dom, (diff, nli, acc_min) in domain_specs.items():
+        assert f"{dom} Diff ↓" in rendered
+        assert f"{dom} NLI ↑" in rendered
+        assert f"{dom} Acc Min ↑" in rendered
+        assert f"{diff:.1f}" in rendered
+        assert f"{nli:.3f}" in rendered
+        assert f"{acc_min:.3f}" in rendered
+
+    captured_legend_labels: list[str] = []
+    captured_bar_heights: list[float] = []
+    orig_close = plt.close
+
+    def _inspect_and_close(fig=None):
+        if fig is not None and hasattr(fig, "axes") and len(fig.axes) >= 2:
+            ax_dom = fig.axes[1]
+            legend = ax_dom.get_legend()
+            if legend is not None:
+                captured_legend_labels.extend(t.get_text() for t in legend.get_texts())
+            captured_bar_heights.extend(patch.get_height() for patch in ax_dom.patches)
+        return orig_close(fig)
+
+    monkeypatch.setattr(plt, "close", _inspect_and_close)
+    plot_path = tmp_path / "comparison_plot.png"
+    _plot_comparison(
+        summaries_dense=summary_dense,
+        domain_breakdowns=domain_breakdowns,
+        summaries_multipara=[],
+        human_ref=None,
+        out_path=plot_path,
+    )
+    assert plot_path.exists() and plot_path.stat().st_size > 0
+    assert set(captured_legend_labels) == {
+        "Coding",
+        "Technical Docs",
+        "Essay",
+        "Workplace Chat",
+    }
+    assert len(captured_bar_heights) == 4
+    assert all(h > 0.0 for h in captured_bar_heights)

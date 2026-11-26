@@ -16,6 +16,7 @@ DEFAULT_LORA_ADAPTER = "8q0sb/qwen25-3b-psycholinguistic-reversal-lora"
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
 
 SUPPORTED_BACKENDS: tuple[str, ...] = (
     "classical",
@@ -174,10 +175,15 @@ class Rewriter:
                     f"Missing API key for {self.backend!r} backend. "
                     f"Pass api_key=... or set {env_var}."
                 )
+            resolved_model = (
+                DEFAULT_OPENROUTER_MODEL
+                if self.backend == "openrouter" and self.model is None
+                else self.model
+            )
             candidate_kwargs: dict[str, Any] = {
                 "api_key": api_key,
                 "base_url": base_url,
-                "model": self.model,
+                "model": resolved_model,
                 "skip_if_clear": self.skip_if_clear,
                 "analyzer": self._analyzer,
             }
@@ -223,7 +229,9 @@ class Rewriter:
             )
             gen = QwenZeroShotReverser(**gen_kwargs)
             self._owned_resources.append(gen)
-            sem = SemanticEvaluator()
+            sem_kwargs = _filter_kwargs(SemanticEvaluator.__init__, {"role": "rerank"})
+            sem = SemanticEvaluator(**sem_kwargs)
+            self._owned_resources.append(sem)
             bon_kwargs = _filter_kwargs(
                 BestOfNPsycholinguisticReverser.__init__,
                 {

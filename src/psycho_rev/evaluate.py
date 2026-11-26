@@ -151,6 +151,18 @@ def _summarize_by_domain(rows: list[dict[str, Any]]) -> dict[str, dict[str, floa
     return out
 
 
+def _discover_domains(domain_breakdowns: list[dict[str, Any]]) -> list[str]:
+    """Return all non-empty domain keys present across breakdown rows in stable order."""
+    discovered: list[str] = []
+    for row in domain_breakdowns:
+        for key, val in row.items():
+            if key == "method" or not isinstance(val, dict) or not val:
+                continue
+            if key not in discovered:
+                discovered.append(key)
+    return discovered
+
+
 def _summarize_out_of_lexicon(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Break down summary metrics into out_of_lexicon vs in_lexicon buckets when flags exist."""
     ool_rows = [r for r in rows if r.get("is_out_of_lexicon") is True]
@@ -295,20 +307,20 @@ def _plot_comparison(
     ax = axes[1]
     dom_map = {d["method"]: d for d in domain_breakdowns}
     x = np.arange(len(methods))
-    active_domains = [
-        d for d in DOMAINS if any(d in row for row in domain_breakdowns)
-    ]
-    if not active_domains:
-        extra_domains: list[str] = []
-        for row in domain_breakdowns:
-            for k in row:
-                if k != "method" and k not in extra_domains:
-                    extra_domains.append(k)
-        active_domains = extra_domains[:4]
+    active_domains = _discover_domains(domain_breakdowns)
 
     if active_domains:
         w = 0.75 / max(len(active_domains), 1)
-        dom_palette = ["#2563eb", "#059669", "#d97706", "#7c3aed"]
+        dom_palette = [
+            "#2563eb",
+            "#059669",
+            "#d97706",
+            "#7c3aed",
+            "#dc2626",
+            "#0f766e",
+            "#be123c",
+            "#64748b",
+        ]
         offsets = np.linspace(
             -w * (len(active_domains) - 1) / 2.0,
             w * (len(active_domains) - 1) / 2.0,
@@ -320,7 +332,7 @@ def _plot_comparison(
                 x + offset,
                 vals,
                 width=w,
-                label=dom.capitalize(),
+                label=dom.replace("_", " ").title(),
                 color=dom_palette[idx_d % len(dom_palette)],
                 alpha=0.9,
             )
@@ -459,7 +471,10 @@ def _append_domain_table(
 ) -> None:
     if not domain_breakdowns:
         return
-    if any("chat" in row or "coding" in row or "essay" in row for row in domain_breakdowns):
+    active_domains = _discover_domains(domain_breakdowns)
+    if not active_domains:
+        return
+    if set(active_domains) == set(DOMAINS):
         md_lines.extend(
             [
                 "",
@@ -480,20 +495,12 @@ def _append_domain_table(
             )
         return
 
-    extra_domains: list[str] = []
-    for row in domain_breakdowns:
-        for k in row:
-            if k != "method" and k not in extra_domains:
-                extra_domains.append(k)
-    if not extra_domains:
-        return
-
-    header = "| Method | " + " | ".join(f"{d} Diff ↓ | {d} NLI ↑ | {d} Acc Min ↑" for d in extra_domains) + " |"
-    sep = "| :--- | " + " | ".join("---: | ---: | ---:" for _ in extra_domains) + " |"
+    header = "| Method | " + " | ".join(f"{d} Diff ↓ | {d} NLI ↑ | {d} Acc Min ↑" for d in active_domains) + " |"
+    sep = "| :--- | " + " | ".join("---: | ---: | ---:" for _ in active_domains) + " |"
     md_lines.extend(["", title, "", header, sep])
     for row in domain_breakdowns:
         cells = []
-        for d in extra_domains:
+        for d in active_domains:
             sub = row.get(d, {})
             cells.append(
                 f"{sub.get('difficulty_score', 0.0):.1f} | {sub.get('nli_min_entailment', 0.0):.3f} | {sub.get('acceptability_min', 1.0):.3f}"

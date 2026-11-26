@@ -469,3 +469,275 @@ def test_server_returns_500_on_backend_error():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: skip_if_clear override, OpenRouter default, cleanup, lock
+# ---------------------------------------------------------------------------
+
+
+def test_openai_reverser_skip_if_clear_override_and_last_skipped_flag():
+    import httpx
+    from psycho_rev.neural import OpenAICompatibleReverser
+
+    requests_made: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Rewritten clear text."}}]},
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(_handler))
+    rev = OpenAICompatibleReverser(
+        api_key="test-key",
+        skip_if_clear=True,
+        clear_difficulty_threshold=20.0,
+        analyzer=_StubAnalyzer(),
+        client=client,
+    )
+    try:
+        # Clear text (difficulty 12.0 <= 20.0) skipped by default
+        out_skipped = rev.rewrite("This is clear text.")
+        assert out_skipped == "This is clear text."
+        assert rev.last_skipped_as_clear is True
+        assert len(requests_made) == 0
+
+        # Explicit per-call override forces rewrite
+        out_forced = rev.rewrite("This is clear text.", skip_if_clear=False)
+        assert out_forced == "Rewritten clear text."
+        assert rev.last_skipped_as_clear is False
+        assert len(requests_made) == 1
+    finally:
+        client.close()
+
+
+def test_hybrid_reverser_skips_classical_when_neural_skips_as_clear():
+    from psycho_rev.neural import HybridReverser
+
+    class _RecordingClassical:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def rewrite(self, text: str) -> str:
+            self.calls.append(text)
+            return text + " [classical]"
+
+    neural_stub = _StubReverser()
+    classical_stub = _RecordingClassical()
+    hybrid = HybridReverser(neural_stub, classical=classical_stub, skip_if_clear=True)
+
+    # Neural skips -> classical must NOT run and last_skipped_as_clear propagates
+    out_skip = hybrid.rewrite("ALREADY CLEAR leverage.")
+    assert out_skip == "ALREADY CLEAR leverage."
+    assert hybrid.last_skipped_as_clear is True
+    assert classical_stub.calls == []
+
+    # Per-call override skip_if_clear=False -> both neural and classical run
+    out_force = hybrid.rewrite("ALREADY CLEAR leverage.", skip_if_clear=False)
+    assert out_force == "ALREADY CLEAR use. [classical]"
+    assert hybrid.last_skipped_as_clear is False
+    assert classical_stub.calls == ["ALREADY CLEAR use."]
+
+
+def test_best_of_n_skip_if_clear_override_and_flag():
+    from psycho_rev.neural import BestOfNPsycholinguisticReverser
+
+    class _FakeGen:
+        def __init__(self) -> None:
+            self.calls: int = 0
+
+        def generate_candidates(self, text: str, **kwargs: Any) -> list[str]:
+            self.calls += 1
+            return [text.replace("clear", "simple")]
+
+    @dataclass
+    class _FakeSemReport:
+        cosine_similarity: float = 0.95
+        nli_min_entailment: float = 0.9
+        nli_max_contradiction: float = 0.02
+        code_preservation: float = 1.0
+        gpt2_perplexity: float = 20.0
+        length_ratio: float = 1.0
+        acceptability_min: float = 0.95
+
+    class _FakeSem:
+        def evaluate_batch(self, originals: list[str], candidates: list[str]) -> list[_FakeSemReport]:
+            return [_FakeSemReport() for _ in candidates]
+
+    gen = _FakeGen()
+    bon = BestOfNPsycholinguisticReverser(
+        gen,
+        _StubAnalyzer(),  # type: ignore[arg-type]
+        _FakeSem(),  # type: ignore[arg-type]
+        skip_if_clear=True,
+        clear_difficulty_threshold=20.0,
+    )
+
+    out_skip = bon.rewrite("This is clear.")
+    assert out_skip == "This is clear."
+    assert bon.last_skipped_as_clear is True
+    assert gen.calls == 0
+
+    out_force = bon.rewrite("This is clear.", skip_if_clear=False)
+    assert out_force == "This is simple."
+    assert bon.last_skipped_as_clear is False
+    assert gen.calls == 1
+
+
+def test_rewriter_openrouter_default_model(monkeypatch: pytest.MonkeyPatch):
+    captured: list[dict[str, Any]] = []
+
+    class FakeOpenAICompatibleReverser:
+        def __init__(
+            self,
+            api_key: str,
+            base_url: str,
+            model: str = "gpt-4o-mini",
+            skip_if_clear: bool = True,
+        ) -> None:
+            captured.append({"base_url": base_url, "model": model})
+
+        def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+            return text
+
+        def close(self) -> None:
+            pass
+
+    fake_neural = types.ModuleType("psycho_rev.neural")
+    fake_neural.OpenAICompatibleReverser = FakeOpenAICompatibleReverser  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycho_rev.neural", fake_neural)
+    monkeypatch.setattr(psycho_rev, "neural", fake_neural, raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
+
+    with Rewriter(backend="openrouter", compute_metrics=False) as rw_or:
+        rw_or.rewrite("Sample text.")
+    with Rewriter(backend="openai", compute_metrics=False) as rw_oai:
+        rw_oai.rewrite("Sample text.")
+
+    assert captured[0]["model"] == "openai/gpt-4o-mini"
+    assert captured[1]["model"] == "gpt-4o-mini"
+
+
+@pytest.mark.parametrize("backend", ["best-of-n", "hybrid-bon"])
+def test_rewriter_semantic_evaluator_rerank_role_and_cleanup(
+    backend: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    gen_instances: list[Any] = []
+    sem_instances: list[Any] = []
+
+    class FakeGen:
+        def __init__(self, model_name: str = "") -> None:
+            self.model_name = model_name
+            self.closed = False
+            gen_instances.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeSem:
+        def __init__(self, role: str = "eval") -> None:
+            self.role = role
+            self.closed = False
+            sem_instances.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeBoN:
+        def __init__(self, gen: Any, analyzer: Any, sem: Any, **kwargs: Any) -> None:
+            self.last_skipped_as_clear = False
+
+        def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+            return text.replace("leverage", "use")
+
+    class FakeHybrid:
+        def __init__(self, neural: Any, **kwargs: Any) -> None:
+            self.neural = neural
+            self.last_skipped_as_clear = False
+
+        def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+            return self.neural.rewrite(text, skip_if_clear=skip_if_clear)
+
+    fake_neural = types.ModuleType("psycho_rev.neural")
+    fake_neural.QwenZeroShotReverser = FakeGen  # type: ignore[attr-defined]
+    fake_neural.BestOfNPsycholinguisticReverser = FakeBoN  # type: ignore[attr-defined]
+    fake_neural.HybridReverser = FakeHybrid  # type: ignore[attr-defined]
+
+    fake_semantics = types.ModuleType("psycho_rev.semantics")
+    fake_semantics.SemanticEvaluator = FakeSem  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "psycho_rev.neural", fake_neural)
+    monkeypatch.setitem(sys.modules, "psycho_rev.semantics", fake_semantics)
+
+    with Rewriter(backend=backend, analyzer=_StubAnalyzer(), compute_metrics=False) as rw:
+        res = rw.rewrite("We leverage tools.")
+        assert res.rewritten == "We use tools."
+        assert len(sem_instances) == 1
+        assert sem_instances[0].role == "rerank"
+        assert sem_instances[0].closed is False
+        assert gen_instances[0].closed is False
+
+    assert sem_instances[0].closed is True
+    assert gen_instances[0].closed is True
+
+
+def test_server_serializes_concurrent_rewriter_calls():
+    import time
+
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+
+    class _SlowReverser:
+        def rewrite(self, text: str, *, skip_if_clear: bool | None = None) -> str:
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.08)
+            with state_lock:
+                active -= 1
+            return text.replace("leverage", "use")
+
+    rewriter = Rewriter(
+        backend="classical",
+        analyzer=_StubAnalyzer(),
+        reverser=_SlowReverser(),
+        compute_metrics=False,
+    )
+    server = create_server(rewriter, host="127.0.0.1", port=0)
+    port = server.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        results: list[tuple[int, dict[str, Any]]] = []
+
+        def _worker() -> None:
+            res = _http_request(
+                f"{base}/rewrite",
+                method="POST",
+                body=json.dumps({"text": "We leverage caches."}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            results.append(res)
+
+        t1 = threading.Thread(target=_worker)
+        t2 = threading.Thread(target=_worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert len(results) == 2
+        assert all(status == 200 for status, _ in results)
+        assert max_active == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        srv_thread.join(timeout=5)
