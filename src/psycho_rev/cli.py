@@ -6,29 +6,59 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Sequence
 
-from psycho_rev.classical import ClassicalReverser
-from psycho_rev.features import PsycholinguisticAnalyzer
+REWRITE_METHODS: tuple[str, ...] = (
+    "openrouter",
+    "openai",
+    "lora",
+    "best-of-n",
+    "hybrid-bon",
+    "hybrid-lora",
+    "classical",
+    "zeroshot",
+    "rtt",
+)
 
 
 def _read_input_text(
     parser: argparse.ArgumentParser,
     text_arg: str | None,
     file_arg: str | None,
-) -> str:
+) -> tuple[str, str]:
+    """Return ``(text, display_filename)`` from ``--file``, positional text, or stdin."""
     if file_arg is not None:
         if file_arg == "-":
-            return sys.stdin.read()
-        return Path(file_arg).read_text(encoding="utf-8")
+            return sys.stdin.read(), "stdin"
+        return Path(file_arg).read_text(encoding="utf-8"), file_arg
     if text_arg is not None:
-        return text_arg
+        if text_arg == "-":
+            return sys.stdin.read(), "stdin"
+        return text_arg, "input"
     if not sys.stdin.isatty():
-        return sys.stdin.read()
+        return sys.stdin.read(), "stdin"
     parser.error("Provide input text as a positional argument, via --file <path>, or via stdin (-).")
-    return ""
+    return "", "input"
 
 
-def main() -> None:
+def _format_analysis_text(report: dict[str, object]) -> str:
+    lines = [
+        f"Difficulty score:       {report.get('difficulty_score')}",
+        f"Words / Sentences:      {report.get('word_count')} / {report.get('sentence_count')}",
+        f"Unattested bigrams:     {report.get('unattested_bigram_rate')}",
+        f"Trigram perplexity:     {report.get('trigram_perplexity')}",
+        f"Mean / Std dep length:  {report.get('mean_dep_length')} / {report.get('std_dep_length')}",
+        f"Reduced ORCs:           {report.get('reduced_orc_count')} ({report.get('reduced_orc_per_100w')}/100w)",
+        f"Stacked noun compounds: {report.get('stacked_noun_count')} ({report.get('stacked_noun_per_100w')}/100w)",
+        f"Denominal verbs:        {report.get('denominal_verb_count')} ({report.get('denominal_verb_per_100w')}/100w)",
+        f"Inanimate subjects:     {report.get('inanimate_subj_count')} ({report.get('inanimate_subj_per_100w')}/100w)",
+    ]
+    return "\n".join(lines)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    from psycho_rev.rewriter import DEFAULT_LORA_ADAPTER
+
     parser = argparse.ArgumentParser(
         prog="psycho-rev",
         description="Analyze and reverse psycholinguistic difficulty features in LLM text.",
@@ -36,122 +66,179 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_an = sub.add_parser("analyze", help="Compute all six psycholinguistic features for input text")
-    p_an.add_argument("text", nargs="?", default=None, help="Text to analyze (or use --file / stdin)")
+    p_an.add_argument("text", nargs="?", default=None, help="Text to analyze, or '-' for stdin")
     p_an.add_argument("--file", dest="input_file", default=None, help="Path to input file, or '-' for stdin")
+    p_an.add_argument("--json", dest="as_json", action="store_true", help="Emit full JSON feature report")
 
-    p_rw = sub.add_parser("rewrite", help="Rewrite text using a classical, neural, or hybrid reverser")
-    p_rw.add_argument("text", nargs="?", default=None, help="Text to rewrite (or use --file / stdin)")
+    p_rw = sub.add_parser("rewrite", help="Rewrite text using a classical, neural, API, or hybrid reverser")
+    p_rw.add_argument("text", nargs="?", default=None, help="Text to rewrite, or '-' for stdin")
     p_rw.add_argument("--file", dest="input_file", default=None, help="Path to input file, or '-' for stdin")
+    p_rw.add_argument(
+        "--method",
+        choices=list(REWRITE_METHODS),
+        default="classical",
+        help="Rewriting backend to use (default: classical)",
+    )
+    p_rw.add_argument("--model", default=None, help="Model name for API or local neural backends")
+    p_rw.add_argument("--base-url", default=None, help="Custom base URL for OpenAI-compatible API backends")
+    p_rw.add_argument(
+        "--adapter-dir",
+        default=DEFAULT_LORA_ADAPTER,
+        help="LoRA adapter directory or Hugging Face repo ID",
+    )
+    p_rw.add_argument("--samples", type=int, default=6, help="Candidate count for best-of-n / hybrid-bon")
+    p_rw.add_argument(
+        "--in-place",
+        "-i",
+        action="store_true",
+        help="Edit --file in place when changes are made",
+    )
+    p_rw.add_argument("--diff", action="store_true", help="Print a unified diff of changes")
     p_rw.add_argument(
         "--plain",
         action="store_true",
-        help="Emit only the rewritten text (suitable for Unix pipes) instead of JSON",
+        help="Emit only the rewritten text (suitable for Unix pipes)",
+    )
+    p_rw.add_argument("--json", dest="as_json", action="store_true", help="Emit full RewriteResult JSON")
+    p_rw.add_argument(
+        "--no-skip-clear",
+        action="store_true",
+        help="Disable clear-text gating and always rewrite",
     )
     p_rw.add_argument(
+        "--unsafe-classical",
+        action="store_true",
+        help="Disable safe mode for the classical reverser",
+    )
+
+    p_srv = sub.add_parser("serve", help="Run the local HTTP JSON server")
+    p_srv.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p_srv.add_argument("--port", type=int, default=8787, help="Bind port (default: 8787)")
+    p_srv.add_argument(
         "--method",
-        choices=["classical", "nllb", "qwen", "best-of-n", "lora", "hybrid-bon", "hybrid-lora"],
+        choices=list(REWRITE_METHODS),
         default="classical",
+        help="Rewriting backend to serve (default: classical)",
     )
-    p_rw.add_argument(
+    p_srv.add_argument("--model", default=None, help="Model name for API or local neural backends")
+    p_srv.add_argument("--base-url", default=None, help="Custom base URL for OpenAI-compatible API backends")
+    p_srv.add_argument(
         "--adapter-dir",
-        default="8q0sb/qwen25-3b-psycholinguistic-reversal-lora",
+        default=DEFAULT_LORA_ADAPTER,
         help="LoRA adapter directory or Hugging Face repo ID",
     )
-    p_rw.add_argument(
-        "--base-model",
-        default=None,
-        help="Optional base model override (auto-detected from adapter_config.json for LoRA methods)",
-    )
-    p_rw.add_argument("--samples", type=int, default=6, help="Candidate count for best-of-n / hybrid-bon")
+    p_srv.add_argument("--no-skip-clear", action="store_true", help="Disable clear-text gating")
+    p_srv.add_argument("--unsafe-classical", action="store_true", help="Disable safe mode for classical backend")
 
-    p_bench = sub.add_parser("bench", help="Run the full multi-domain benchmark")
-    p_bench.add_argument("--results-dir", default="results")
-    p_bench.add_argument("--adapter-dir", default="checkpoints/qwen25-3b-psycho-rev-lora")
-    p_bench.add_argument("--classical-only", action="store_true")
-    p_bench.add_argument("--skip-nllb", action="store_true")
-    p_bench.add_argument("--skip-multipara", action="store_true")
-    p_bench.add_argument("--nli-model", default=None)
+    p_corpus = sub.add_parser("build-corpus", help="Build training/evaluation corpus")
+    p_corpus.add_argument("extra_args", nargs=argparse.REMAINDER, help="Arguments forwarded to corpus_builder")
 
-    args = parser.parse_args()
+    p_eval = sub.add_parser("evaluate", help="Run benchmark evaluation")
+    p_eval.add_argument("extra_args", nargs=argparse.REMAINDER, help="Arguments forwarded to evaluate")
+
+    return parser
+
+
+def _delegate_entrypoint(module_name: str, extra_args: list[str]) -> int:
+    import importlib
+
+    mod = importlib.import_module(module_name)
+    main_fn = getattr(mod, "main")
+    prev_argv = sys.argv
+    sys.argv = [module_name, *extra_args]
+    try:
+        ret = main_fn()
+    finally:
+        sys.argv = prev_argv
+    return int(ret) if isinstance(ret, int) else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "build-corpus":
+        return _delegate_entrypoint("psycho_rev.corpus_builder", raw_argv[1:])
+    if raw_argv and raw_argv[0] == "evaluate":
+        return _delegate_entrypoint("psycho_rev.evaluate", raw_argv[1:])
+
+    parser = _build_parser()
+    args = parser.parse_args(raw_argv)
 
     if args.cmd == "analyze":
-        text = _read_input_text(parser, args.text, args.input_file)
-        analyzer = PsycholinguisticAnalyzer()
-        print(json.dumps(analyzer.analyze(text).to_dict(), indent=2))
-    elif args.cmd == "rewrite":
-        text = _read_input_text(parser, args.text, args.input_file)
-        analyzer = None if args.plain else PsycholinguisticAnalyzer()
-        before = analyzer.analyze(text) if analyzer is not None else None
+        text, _ = _read_input_text(parser, args.text, args.input_file)
+        from psycho_rev.rewriter import Rewriter
 
-        if args.method == "classical":
-            rew = ClassicalReverser().rewrite(text)
-        elif args.method == "nllb":
-            from psycho_rev.neural import NLLBRoundTripReverser
-
-            model = NLLBRoundTripReverser()
-            rew = model.rewrite(text)
-            model.close()
-        elif args.method == "qwen":
-            from psycho_rev.neural import QwenZeroShotReverser
-
-            model = QwenZeroShotReverser(model_name=args.base_model or "Qwen/Qwen2.5-3B-Instruct")
-            rew = model.rewrite(text)
-            model.close()
-        elif args.method in ("best-of-n", "hybrid-bon"):
-            from psycho_rev.neural import (
-                BestOfNPsycholinguisticReverser,
-                HybridReverser,
-                QwenZeroShotReverser,
-            )
-            from psycho_rev.semantics import SemanticEvaluator
-
-            an = analyzer or PsycholinguisticAnalyzer()
-            gen = QwenZeroShotReverser(model_name=args.base_model or "Qwen/Qwen2.5-3B-Instruct")
-            sem = SemanticEvaluator()
-            bon = BestOfNPsycholinguisticReverser(gen, an, sem, num_samples=args.samples)
-            if args.method == "hybrid-bon":
-                rew = HybridReverser(bon).rewrite(text)
-            else:
-                rew = bon.rewrite(text)
-            gen.close()
+        rewriter = Rewriter(backend="classical")
+        report = rewriter.analyze(text)
+        data = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+        if args.as_json:
+            print(json.dumps(data, indent=2))
         else:
-            from psycho_rev.neural import HybridReverser, LoRASinglePassReverser
+            print(_format_analysis_text(data))
+        return 0
 
-            lora = LoRASinglePassReverser(args.adapter_dir, base_model=args.base_model)
-            if args.method == "hybrid-lora":
-                rew = HybridReverser(lora).rewrite(text)
-            else:
-                rew = lora.rewrite(text)
-            lora.close()
+    if args.cmd == "rewrite":
+        if args.in_place and (not args.input_file or args.input_file == "-"):
+            parser.error("--in-place requires --file <path> pointing to a real file.")
 
-        if args.plain:
-            print(rew)
-        else:
-            assert analyzer is not None and before is not None
-            after = analyzer.analyze(rew)
-            print(
-                json.dumps(
-                    {
-                        "original": text,
-                        "rewritten": rew,
-                        "before": before.difficulty_score,
-                        "after": after.difficulty_score,
-                    },
-                    indent=2,
-                )
-            )
-    elif args.cmd == "bench":
-        from psycho_rev.evaluate import run_benchmark
+        from psycho_rev.rewriter import Rewriter, unified_diff
 
-        run_benchmark(
-            results_dir=Path(args.results_dir),
-            adapter_dir=Path(args.adapter_dir) if args.adapter_dir else None,
-            include_neural=not args.classical_only,
-            skip_nllb=args.skip_nllb,
-            skip_multipara=args.skip_multipara,
-            nli_model=args.nli_model,
+        need_metrics = bool(args.as_json)
+        rewriter = Rewriter(
+            backend=args.method,
+            model=args.model,
+            base_url=args.base_url,
+            adapter_dir=args.adapter_dir,
+            samples=args.samples,
+            skip_if_clear=not args.no_skip_clear,
+            safe_mode=not args.unsafe_classical,
+            compute_metrics=need_metrics,
         )
+        try:
+            if args.in_place:
+                result = rewriter.rewrite_file(args.input_file, in_place=True)
+                filename = args.input_file
+            else:
+                text, filename = _read_input_text(parser, args.text, args.input_file)
+                result = rewriter.rewrite(text)
+        finally:
+            rewriter.close()
+
+        if args.as_json:
+            print(json.dumps(result.to_dict(), indent=2))
+        elif args.diff:
+            diff_text = unified_diff(result.original, result.rewritten, filename=filename)
+            if diff_text:
+                sys.stdout.write(diff_text)
+        elif args.plain or not args.in_place:
+            sys.stdout.write(result.rewritten)
+            if result.rewritten and not result.rewritten.endswith("\n"):
+                sys.stdout.write("\n")
+        return 0
+
+    if args.cmd == "serve":
+        from psycho_rev.rewriter import Rewriter
+        from psycho_rev.server import serve
+
+        rewriter = Rewriter(
+            backend=args.method,
+            model=args.model,
+            base_url=args.base_url,
+            adapter_dir=args.adapter_dir,
+            skip_if_clear=not args.no_skip_clear,
+            safe_mode=not args.unsafe_classical,
+        )
+        serve(rewriter, host=args.host, port=args.port)
+        return 0
+
+    if args.cmd == "build-corpus":
+        return _delegate_entrypoint("psycho_rev.corpus_builder", list(args.extra_args))
+
+    if args.cmd == "evaluate":
+        return _delegate_entrypoint("psycho_rev.evaluate", list(args.extra_args))
+
+    parser.error(f"Unknown command: {args.cmd}")
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
