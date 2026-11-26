@@ -41,6 +41,19 @@ from psycho_rev.semantics import (
 
 DOMAINS: tuple[str, ...] = ("chat", "coding", "essay")
 
+def _select_evaluator_device() -> str:
+    """Use CPU for auxiliary evaluators on <=12 GB GPUs so 3B generators never OOM."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            if total_gb >= 14.0:
+                return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 
 @dataclass(frozen=True)
 class EvalSample:
@@ -177,19 +190,13 @@ def _summarize_out_of_lexicon(rows: list[dict[str, Any]]) -> dict[str, dict[str,
     return out
 
 
-def _evaluate_method(
-    name: str,
+def _generate_outputs(
     samples: Sequence[BenchmarkSample | EvalSample],
     rewriter_fn: Callable[[str], str],
-    analyzer: PsycholinguisticAnalyzer,
-    semantics: SemanticEvaluator,
-    split: str = "single",
     extra_latency_fn: Callable[[str], float] | None = None,
-) -> list[dict[str, Any]]:
-    originals = [s.text for s in samples]
+) -> tuple[list[str], list[float]]:
     rewrittens: list[str] = []
     latencies: list[float] = []
-
     for s in samples:
         t0 = time.perf_counter()
         rew = rewriter_fn(s.text)
@@ -198,8 +205,20 @@ def _evaluate_method(
             dt_ms += extra_latency_fn(s.text)
         rewrittens.append(rew)
         latencies.append(round(dt_ms, 1))
+    return rewrittens, latencies
 
-    sem_reports = semantics.evaluate_batch(originals, rewrittens)
+
+def _score_outputs(
+    name: str,
+    samples: Sequence[BenchmarkSample | EvalSample],
+    rewrittens: Sequence[str],
+    latencies: Sequence[float],
+    analyzer: PsycholinguisticAnalyzer,
+    semantics: SemanticEvaluator,
+    split: str = "single",
+) -> list[dict[str, Any]]:
+    originals = [s.text for s in samples]
+    sem_reports = semantics.evaluate_batch(originals, list(rewrittens))
     rows: list[dict[str, Any]] = []
     for sample, rew, lat, sem in zip(samples, rewrittens, latencies, sem_reports):
         feat = analyzer.analyze(rew)
@@ -225,6 +244,18 @@ def _evaluate_method(
         rows.append(row)
     return rows
 
+
+def _evaluate_method(
+    name: str,
+    samples: Sequence[BenchmarkSample | EvalSample],
+    rewriter_fn: Callable[[str], str],
+    analyzer: PsycholinguisticAnalyzer,
+    semantics: SemanticEvaluator,
+    split: str = "single",
+    extra_latency_fn: Callable[[str], float] | None = None,
+) -> list[dict[str, Any]]:
+    rewrittens, latencies = _generate_outputs(samples, rewriter_fn, extra_latency_fn=extra_latency_fn)
+    return _score_outputs(name, samples, rewrittens, latencies, analyzer, semantics, split=split)
 
 def _plot_comparison(
     summaries_dense: list[dict[str, Any]],
@@ -662,11 +693,7 @@ def run_benchmark(
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     analyzer = PsycholinguisticAnalyzer()
-    semantics = HeldOutSemanticEvaluator(
-        nli_model=nli_model or DEFAULT_EVAL_NLI_MODEL,
-        lm_model=lm_model or DEFAULT_HELDOUT_FLUENCY_MODEL,
-        enable_acceptability=enable_acceptability,
-    )
+    eval_device = _select_evaluator_device()
     classical = ClassicalReverser()
 
     use_external = dataset_path is not None
@@ -692,109 +719,62 @@ def run_benchmark(
     domain_multipara: list[dict[str, Any]] = []
     summaries_human_multipara: list[dict[str, Any]] = []
 
+    # Phase 1: generate all outputs, closing each neural generator before loading the next.
+    generated_runs: list[dict[str, Any]] = []
+
     def _run_and_record(
         name: str,
         fn: Callable[[str], str],
         extra_latency_fn: Callable[[str], float] | None = None,
     ) -> None:
-        print(f"=== Running method: {name} ===")
-        dense_rows = _evaluate_method(
-            name,
-            primary_samples,
-            fn,
-            analyzer,
-            semantics,
-            split=primary_split,
-            extra_latency_fn=extra_latency_fn,
+        print(f"=== Generating outputs: {name} ===")
+        p_rew, p_lat = _generate_outputs(primary_samples, fn, extra_latency_fn=extra_latency_fn)
+        c_rew, c_lat = (
+            _generate_outputs(control_samples, fn, extra_latency_fn=extra_latency_fn)
+            if control_samples
+            else ([], [])
         )
-        all_rows.extend(dense_rows)
-
-        s_dense = {"method": name, **_summarize_rows(dense_rows)}
-        summaries_dense.append(s_dense)
-        domain_dense.append({"method": name, **_summarize_by_domain(dense_rows)})
-        ool_stats = _summarize_out_of_lexicon(dense_rows)
-        if ool_stats:
-            ool_dense.append({"method": name, **ool_stats})
-
-        if control_samples:
-            human_rows = _evaluate_method(
-                name,
-                control_samples,
-                fn,
-                analyzer,
-                semantics,
-                split=primary_split,
-                extra_latency_fn=extra_latency_fn,
-            )
-            all_rows.extend(human_rows)
-            s_human = {"method": name, **_summarize_rows(human_rows)}
-            summaries_human.append(s_human)
-
-        split_tag = "External" if use_external else "Single Dense"
-        print(
-            f"  [{split_tag}] diff={s_dense['difficulty_score']:.1f} "
-            f"cos={s_dense['cosine_similarity']:.3f} nli={s_dense['nli_min_entailment']:.3f} "
-            f"contra={s_dense['nli_max_contradiction']:.3f} ppl={s_dense['gpt2_perplexity']:.1f} "
-            f"acc={s_dense['acceptability_mean']:.3f}/{s_dense['acceptability_min']:.3f} "
-            f"code={s_dense['code_preservation']:.3f} lat={s_dense['latency_ms']:.0f}ms"
+        mp_rew, mp_lat = (
+            _generate_outputs(MULTIPARA_BENCHMARK, fn, extra_latency_fn=extra_latency_fn)
+            if not effective_skip_multipara
+            else ([], [])
+        )
+        mph_rew, mph_lat = (
+            _generate_outputs(HUMAN_CONTROL_MULTIPARA, fn, extra_latency_fn=extra_latency_fn)
+            if not effective_skip_multipara
+            else ([], [])
+        )
+        generated_runs.append(
+            {
+                "name": name,
+                "primary": (p_rew, p_lat),
+                "control": (c_rew, c_lat),
+                "mp": (mp_rew, mp_lat),
+                "mp_human": (mph_rew, mph_lat),
+            }
         )
 
-        if not effective_skip_multipara:
-            mp_dense_rows = _evaluate_method(
-                name,
-                MULTIPARA_BENCHMARK,
-                fn,
-                analyzer,
-                semantics,
-                split="multipara",
-                extra_latency_fn=extra_latency_fn,
-            )
-            mp_human_rows = _evaluate_method(
-                name,
-                HUMAN_CONTROL_MULTIPARA,
-                fn,
-                analyzer,
-                semantics,
-                split="multipara",
-                extra_latency_fn=extra_latency_fn,
-            )
-            all_rows.extend(mp_dense_rows)
-            all_rows.extend(mp_human_rows)
+    # 1. Original baseline
+    _run_and_record("Original", lambda x: x)
 
-            s_mp = {"method": name, **_summarize_rows(mp_dense_rows)}
-            s_mp_h = {"method": name, **_summarize_rows(mp_human_rows)}
-            summaries_multipara.append(s_mp)
-            domain_multipara.append({"method": name, **_summarize_by_domain(mp_dense_rows)})
-            summaries_human_multipara.append(s_mp_h)
-            print(
-                f"  [Multi-Para]   diff={s_mp['difficulty_score']:.1f} "
-                f"cos={s_mp['cosine_similarity']:.3f} nli={s_mp['nli_min_entailment']:.3f} "
-                f"contra={s_mp['nli_max_contradiction']:.3f} ppl={s_mp['gpt2_perplexity']:.1f} "
-                f"acc={s_mp['acceptability_mean']:.3f}/{s_mp['acceptability_min']:.3f} "
-                f"code={s_mp['code_preservation']:.3f} lat={s_mp['latency_ms']:.0f}ms"
-            )
+    # 2. Classical rule-based reverser
+    _run_and_record("Classical (spaCy)", classical.rewrite)
 
-    try:
-        # 1. Original baseline
-        _run_and_record("Original", lambda x: x)
-
-        # 2. Classical rule-based reverser
-        _run_and_record("Classical (spaCy)", classical.rewrite)
-
-        if include_neural:
-            # 3. NLLB-200 Round-Trip Translation (En -> Ja -> En)
-            if not skip_nllb:
-                nllb = NLLBRoundTripReverser("facebook/nllb-200-distilled-600M")
+    if include_neural:
+        # 3. NLLB-200 Round-Trip Translation (En -> Ja -> En)
+        if not skip_nllb:
+            nllb = NLLBRoundTripReverser("facebook/nllb-200-distilled-600M")
+            try:
                 _run_and_record("NLLB-200 RTT", nllb.rewrite)
+            finally:
                 nllb.close()
 
-            # 4. Qwen2.5-3B-Instruct Zero-Shot + Best-of-6 Psycholinguistic Reranking
-            # Use a decoupled fast proxy evaluator for reranking (nli-deberta-v3-small + gpt2)
-            # so held-out evaluation (nli-deberta-v3-base + CoLA + gpt2-medium) stays independent.
-            qwen = QwenZeroShotReverser("Qwen/Qwen2.5-3B-Instruct")
+        # 4. Qwen2.5-3B-Instruct Zero-Shot + Best-of-6 Psycholinguistic Reranking
+        qwen = QwenZeroShotReverser("Qwen/Qwen2.5-3B-Instruct")
+        try:
             _run_and_record("Qwen2.5-3B ZeroShot", qwen.rewrite)
 
-            rerank_semantics = SemanticEvaluator(role="rerank", enable_acceptability=False)
+            rerank_semantics = SemanticEvaluator(device=eval_device, role="rerank", enable_acceptability=False)
             try:
                 reranker = BestOfNPsycholinguisticReverser(
                     qwen, analyzer, rerank_semantics, num_samples=6, classical_fallback=classical
@@ -816,11 +796,13 @@ def run_benchmark(
                 )
             finally:
                 rerank_semantics.close()
-                qwen.close()
+        finally:
+            qwen.close()
 
-            # 5. Fine-tuned LoRA Single-Pass + Hybrid (auto-detects base model from adapter_config.json)
-            if adapter_dir is not None and Path(adapter_dir).exists():
-                lora = LoRASinglePassReverser(adapter_dir, base_model=None, classical_fallback=classical)
+        # 5. Fine-tuned LoRA Single-Pass + Hybrid
+        if adapter_dir is not None and Path(adapter_dir).exists():
+            lora = LoRASinglePassReverser(adapter_dir, base_model=None, classical_fallback=classical)
+            try:
                 lora_label = _format_lora_label(lora.base_model_name)
                 lora_cache: dict[str, tuple[str, float]] = {}
 
@@ -837,7 +819,66 @@ def run_benchmark(
                     lambda x: classical.rewrite(lora_cache[x][0]),
                     extra_latency_fn=lambda x: lora_cache[x][1],
                 )
+            finally:
                 lora.close()
+
+    # Phase 2: score all generated outputs on GPU with zero generator VRAM overlap.
+    semantics = HeldOutSemanticEvaluator(
+        nli_model=nli_model or DEFAULT_EVAL_NLI_MODEL,
+        lm_model=lm_model or DEFAULT_HELDOUT_FLUENCY_MODEL,
+        enable_acceptability=enable_acceptability,
+    )
+    try:
+        split_tag = "External" if use_external else "Single Dense"
+        for run in generated_runs:
+            name = run["name"]
+            print(f"=== Scoring method: {name} ===")
+            p_rew, p_lat = run["primary"]
+            dense_rows = _score_outputs(name, primary_samples, p_rew, p_lat, analyzer, semantics, split=primary_split)
+            all_rows.extend(dense_rows)
+
+            s_dense = {"method": name, **_summarize_rows(dense_rows)}
+            summaries_dense.append(s_dense)
+            domain_dense.append({"method": name, **_summarize_by_domain(dense_rows)})
+            ool_stats = _summarize_out_of_lexicon(dense_rows)
+            if ool_stats:
+                ool_dense.append({"method": name, **ool_stats})
+
+            if control_samples:
+                c_rew, c_lat = run["control"]
+                human_rows = _score_outputs(name, control_samples, c_rew, c_lat, analyzer, semantics, split=primary_split)
+                all_rows.extend(human_rows)
+                s_human = {"method": name, **_summarize_rows(human_rows)}
+                summaries_human.append(s_human)
+
+            print(
+                f"  [{split_tag}] diff={s_dense['difficulty_score']:.1f} "
+                f"cos={s_dense['cosine_similarity']:.3f} nli={s_dense['nli_min_entailment']:.3f} "
+                f"contra={s_dense['nli_max_contradiction']:.3f} ppl={s_dense['gpt2_perplexity']:.1f} "
+                f"acc={s_dense['acceptability_mean']:.3f}/{s_dense['acceptability_min']:.3f} "
+                f"code={s_dense['code_preservation']:.3f} lat={s_dense['latency_ms']:.0f}ms"
+            )
+
+            if not effective_skip_multipara:
+                mp_rew, mp_lat = run["mp"]
+                mph_rew, mph_lat = run["mp_human"]
+                mp_dense_rows = _score_outputs(name, MULTIPARA_BENCHMARK, mp_rew, mp_lat, analyzer, semantics, split="multipara")
+                mp_human_rows = _score_outputs(name, HUMAN_CONTROL_MULTIPARA, mph_rew, mph_lat, analyzer, semantics, split="multipara")
+                all_rows.extend(mp_dense_rows)
+                all_rows.extend(mp_human_rows)
+
+                s_mp = {"method": name, **_summarize_rows(mp_dense_rows)}
+                s_mp_h = {"method": name, **_summarize_rows(mp_human_rows)}
+                summaries_multipara.append(s_mp)
+                domain_multipara.append({"method": name, **_summarize_by_domain(mp_dense_rows)})
+                summaries_human_multipara.append(s_mp_h)
+                print(
+                    f"  [Multi-Para]   diff={s_mp['difficulty_score']:.1f} "
+                    f"cos={s_mp['cosine_similarity']:.3f} nli={s_mp['nli_min_entailment']:.3f} "
+                    f"contra={s_mp['nli_max_contradiction']:.3f} ppl={s_mp['gpt2_perplexity']:.1f} "
+                    f"acc={s_mp['acceptability_mean']:.3f}/{s_mp['acceptability_min']:.3f} "
+                    f"code={s_mp['code_preservation']:.3f} lat={s_mp['latency_ms']:.0f}ms"
+                )
     finally:
         semantics.close()
 

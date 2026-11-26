@@ -1121,11 +1121,23 @@ _IDENTITY_TEACHER_SYSTEM_PROMPT = (
 
 
 def _extract_json_object(raw: str) -> dict[str, Any]:
-    """Parse a JSON object from an LLM response, tolerating optional markdown code fences."""
+    """Parse a JSON object from an LLM response, tolerating optional outer markdown code fences."""
     text = raw.strip()
-    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fence_match:
-        text = fence_match.group(1).strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, count=1)
+        text = re.sub(r"\s*```\s*$", "", text, count=1).strip()
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
