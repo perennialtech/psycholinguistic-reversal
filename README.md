@@ -102,6 +102,72 @@ psycho-rev evaluate \
   --skip-nllb --blind-judge --judge-model openai/gpt-4.1-mini
 ```
 
+## Examples
+
+### 1. Technical Markdown with Code & List Preservation (`openrouter` / `openai/gpt-4.1-mini`)
+
+**Before** (`Diff 122.1`, `PPL 193.6`, `CoLA 0.649`):
+
+> The retry wrapper `fetch_with_backoff()` in `net/http_client.py` silently swallows TLS handshake timeouts, which quietly starves the connection pool whenever upstream certificates rotate. That exception mask also betrays the circuit-breaker counters the observability middleware relies on:
+>
+> ```python
+> try:
+>     return session.get(url, timeout=timeout)
+> except Exception:
+>     return None
+> ```
+>
+> Before we gate the next release, triage the failure path with three steps:
+> - Instrument `fetch_with_backoff()` to surface `ssl.SSLError` separately.
+> - Bucket transient 503 responses apart from socket resets in `metrics/http.py`.
+> - Benchmark pool saturation under burst load before sunsetting the legacy client.
+
+**After** (`Code Preservation 100%` — fenced Python block, inline symbols, and file paths untouched):
+
+> The retry wrapper `fetch_with_backoff()` in `net/http_client.py` silently ignores TLS handshake timeouts. This quietly depletes the connection pool whenever upstream certificates rotate. This exception masking also undermines the circuit-breaker counters that the observability middleware relies on:
+>
+> ```python
+> try:
+>     return session.get(url, timeout=timeout)
+> except Exception:
+>     return None
+> ```
+>
+> Before we gate the next release, triage the failure path using these three steps:
+> - Instrument `fetch_with_backoff()` to surface `ssl.SSLError` separately.
+> - Exclude bucket transient 503 responses except for socket resets in `metrics/http.py`.
+> - Measure benchmark pool saturation during burst load before retiring the legacy client.
+
+### 2. Dense Multi-Paragraph Workplace Prose (Local `Qwen2.5-3B Best-of-6`)
+
+**Before** (`Diff 98.1`, `PPL 369.0`, `CoLA 0.628 / 0.429`):
+
+> The quarterly roadmap alignment deck product leadership circulated yesterday quietly hides the infrastructure migration dependencies engineering flagged last month. That omission already starves our Q3 capacity planning process of realistic headcount buffers, and the executive sign-off cadence we inherited refuses to pause for technical discovery.
+>
+> Before we calendar the cross-functional kickoff, let us workshop a tighter milestone dependency matrix and signpost which customer-facing launches slip if the database sharding work slips. We can bucket the open risks by severity, spotlight the two blocking compliance reviews, and anchor the final schedule on verified sprint velocity rather than optimistic target dates.
+
+**After** (`Diff 54.8`, `PPL 109.4`, `NLI 0.998`, `CoLA 0.918 / 0.850`):
+
+> Yesterday, the quarterly roadmap alignment deck, circulated by product leadership, concealed the infrastructure migration dependencies that engineering identified last month. This oversight undermines the realism of our Q3 capacity planning process, depriving it of necessary headcount buffers, and prevents the executive sign-off cycle from pausing to accommodate technical discoveries.
+>
+> Prior to scheduling the cross-functional kickoff, we should conduct a workshop to refine the milestone dependency matrix and clarify which customer-facing launches would be delayed if the database sharding work falls behind. We can categorize the outstanding risks by their severity, highlight the two critical compliance reviews, and base the final schedule on validated sprint velocity rather than arbitrary optimistic deadlines.
+
+### 3. Single-Sentence Dense Essay (Local `Qwen2.5-3B Best-of-6`)
+
+**Before** (`Diff 94.5`, `PPL 254.9`, `CoLA 0.862`):
+
+> The institutional trust deficit the post-industrial economy inherited quietly punishes civic participation, because fragmented media ecosystems starve public deliberation of shared facts.
+
+**After** (`Diff 41.7`, `PPL 187.3`, `NLI 0.999`, `CoLA 0.947`):
+
+> The institutional trust gap that the post-industrial economy inherited subtly discourages civic engagement, as fragmented media ecosystems deprive public deliberations of common facts.
+
+### 4. Already-Clear Human Prose (Clarity No-Op Gate)
+
+**Input & Output** (`Diff 30.9 < 35.0`, `CoLA 0.936` — returned unchanged by `Best-of-6`, `ZeroShot`, and `LoRA v2`):
+
+> When you check the logs after a failed deploy, start with the earliest error message rather than the final stack trace, because the first failure usually explains the rest.
+
 ## Decoupled Benchmark Results
 
 Evaluation uses a two-phase pipeline that separates reranking proxies (`nli-deberta-v3-small`, `gpt2`) from held-out evaluation (`cross-encoder/nli-deberta-v3-base`, `gpt2-medium` strided perplexity, and `textattack/roberta-base-CoLA` grammatical acceptability), plus a position-swapped blind pairwise LLM judge (`openai/gpt-4.1-mini`).
