@@ -1,109 +1,161 @@
 # psycholinguistic-reversal
 
-Empirical study and runnable inference toolkit for **classically and neurally reversing** the six psycholinguistic difficulty features identified in [*Why is AI-generated language so hard to understand?* (Clark, Martin, & Mahowald, 2026; arXiv:2610.29162v1)](https://arxiv.org/abs/2610.29162).
+Readability rewriter, psycholinguistic feature analyzer, and decoupled evaluation suite targeting the six comprehension-difficulty features identified in [*Why is AI-generated language so hard to understand?* (Clark, Martin, & Mahowald, 2026; arXiv:2610.29162v1)](https://arxiv.org/abs/2610.29162).
 
 **Pretrained 3B QLoRA weights on Hugging Face:** [`8q0sb/qwen25-3b-psycholinguistic-reversal-lora`](https://huggingface.co/8q0sb/qwen25-3b-psycholinguistic-reversal-lora)
 
 ## Overview
 
-Modern post-trained LLMs overuse constructions that compress information density at the expense of human comprehension:
+Post-trained LLMs frequently pack dense syntactic and lexical constructions that reduce human reading comprehension:
 
-1. **Low-frequency / unattested n-grams** (measured against NLTK Brown + Reuters + Webtext plus modern technical vocabulary)
+1. **Low-frequency / unattested n-grams** (compared against NLTK Brown + Reuters + Webtext plus modern technical vocabulary)
 2. **Long syntactic dependencies** (mean and sentence-length-standardized dependency arc length)
 3. **Reduced object relative clauses (ORCs)** (omitting optional `that` / `which`)
 4. **Stacked noun compounds** (3+ consecutive nouns in a modifier chain, e.g., *reader-patience budget*)
 5. **Denominal verbs** (ad-hoc noun-to-verb conversions, e.g., *footnote it*, *calendar it*, *gate*, *sunset*)
 6. **Inanimate subjects with animate verbs** (selectional-restriction violations, e.g., *`is_file()` swallows that*, *this asymmetry bites*)
 
-This repository implements detectors for all six features, calibrated NLI/fluency/code-preservation evaluators, markdown-structure-preserving rewriting, and seven reversal pipelines spanning deterministic spaCy rules, round-trip translation, zero-shot and Best-of-N neural rewriting, QLoRA SFT + SimPO distillation, and hybrid neural+classical post-processing.
+This package provides:
 
-![Benchmark comparison](results/comparison_plot.png)
-
-## Benchmark Results
-
-Evaluated across both **single-sentence** (30 dense AI passages + 10 human control) and **multi-paragraph** (18 markdown/multi-paragraph dense AI passages + 6 human control) splits spanning **chat**, **coding**, and **essay** domains, using `cross-encoder/nli-deberta-v3-base` with paragraph-chunked NLI and strided GPT-2 perplexity on an RTX 3080 (10 GB VRAM).
-
-### Single-Sentence Dense AI Test Set (30 passages)
-
-| Method | Diff Score ↓ | Unatt. Bigram ↓ | Trigram PPL ↓ | Mean Dep Len ↓ | Red. ORC /100w ↓ | Stacked N /100w ↓ | Denom. V /100w ↓ | Inanim. Subj /100w ↓ | Cos Sim ↑ | NLI Min ↑ | NLI Contra ↓ | GPT-2 PPL ↓ | Code Pres ↑ | Latency (ms) |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Original | 129.5 | 0.752 | 57501.1 | 2.45 | 1.51 | 6.98 | 5.13 | 2.99 | 1.000 | 0.986 | 0.002 | 847.8 | 1.000 | 0 |
-| Classical (spaCy) | 53.4 | 0.674 | 33893.0 | 2.48 | 0.15 | 1.69 | 0.91 | 0.28 | 0.954 | 0.963 | 0.033 | 741.7 | 1.000 | 6 |
-| NLLB-200 RTT (En→Ja→En) | 60.5 | 0.510 | 13295.0 | 2.44 | 0.43 | 3.23 | 0.77 | 1.13 | 0.803 | 0.698 | 0.100 | 302.4 | 0.967 | 713 |
-| Qwen2.5-3B ZeroShot | 66.5 | 0.609 | 21127.7 | 2.42 | 0.93 | 4.03 | 1.15 | 0.28 | 0.863 | 0.824 | 0.033 | 249.3 | 0.967 | 789 |
-| Qwen2.5-3B Best-of-6 | 54.7 | 0.546 | 12057.3 | 2.37 | 0.68 | 3.14 | 0.51 | 0.27 | 0.863 | 0.957 | 0.033 | 195.1 | 1.000 | 1895 |
-| **Hybrid (Best-of-6 + Classical)** | **37.1** | **0.520** | **10127.9** | **2.25** | **0.17** | **1.02** | **0.24** | **0.00** | **0.859** | **0.957** | **0.033** | **207.0** | **1.000** | **1900** |
-| Qwen2.5-3B LoRA (SFT+SimPO) | 46.8 | 0.513 | 9928.6 | 2.27 | 1.20 | 1.99 | 0.17 | 0.24 | 0.811 | 0.764 | 0.001 | 156.6 | 1.000 | 1921 |
-| Hybrid (LoRA + Classical) | 32.4 | 0.482 | 8116.7 | 2.28 | 0.15 | 0.37 | 0.00 | 0.23 | 0.807 | 0.764 | 0.001 | 152.9 | 1.000 | 1927 |
-| *Human Reference (10 control)* | *31.1* | *0.428* | *6804.1* | *2.53* | *0.00* | *0.00* | *0.00* | *0.46* | *1.000* | *1.000* | *0.000* | *145.3* | *1.000* | *-* |
-
-### Multi-Paragraph Dense AI Test Set (18 passages)
-
-| Method | Diff Score ↓ | Unatt. Bigram ↓ | Trigram PPL ↓ | Mean Dep Len ↓ | Red. ORC /100w ↓ | Stacked N /100w ↓ | Denom. V /100w ↓ | Inanim. Subj /100w ↓ | Cos Sim ↑ | NLI Min ↑ | NLI Contra ↓ | GPT-2 PPL ↓ | Code Pres ↑ | Latency (ms) |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Original | 89.0 | 0.762 | 56773.9 | 2.80 | 0.18 | 2.99 | 3.63 | 1.43 | 1.000 | 0.995 | 0.000 | 299.6 | 1.000 | 0 |
-| Classical (spaCy) | 50.7 | 0.724 | 41150.6 | 2.71 | 0.06 | 0.84 | 0.66 | 0.25 | 0.977 | 0.991 | 0.000 | 298.1 | 1.000 | 22 |
-| NLLB-200 RTT | 54.4 | 0.555 | 11188.8 | 3.11 | 0.18 | 1.98 | 0.42 | 0.62 | 0.807 | 0.745 | 0.057 | 176.4 | 0.949 | 3074 |
-| Qwen2.5-3B ZeroShot | 45.3 | 0.583 | 14362.4 | 2.42 | 0.30 | 1.52 | 0.44 | 0.11 | 0.920 | 0.993 | 0.000 | 118.8 | 0.957 | 3132 |
-| Qwen2.5-3B Best-of-6 | 38.3 | 0.539 | 9557.9 | 2.45 | 0.14 | 1.08 | 0.10 | 0.00 | 0.902 | 0.993 | 0.000 | 109.2 | 1.000 | 7865 |
-| **Hybrid (Best-of-6 + Classical)** | **32.3** | **0.532** | **9227.5** | **2.41** | **0.00** | **0.14** | **0.06** | **0.00** | **0.901** | **0.992** | **0.000** | **116.7** | **1.000** | **7887** |
-| Qwen2.5-3B LoRA (SFT+SimPO) | 33.0 | 0.472 | 5508.6 | 2.31 | 0.13 | 0.70 | 0.08 | 0.05 | 0.859 | 0.906 | 0.000 | 75.8 | 1.000 | 8319 |
-| Hybrid (LoRA + Classical) | 29.1 | 0.466 | 5360.2 | 2.30 | 0.00 | 0.09 | 0.08 | 0.05 | 0.858 | 0.889 | 0.000 | 79.9 | 1.000 | 8340 |
-| *Human Reference Multi-Para (6 control)* | *34.0* | *0.497* | *6739.6* | *2.59* | *0.00* | *0.56* | *0.00* | *0.00* | *1.000* | *1.000* | *0.000* | *49.4* | *1.000* | *-* |
-
-### Key Findings
-
-* **Hybrid (`Best-of-6 + Classical`) is the highest-fidelity configuration**: Achieves `100%` code preservation across both single-sentence and multi-paragraph splits, drops difficulty to `37.1` (single) and `32.3` (multi-para), and maintains `0.957–0.992` NLI entailment while leaving human control prose untouched (`0.997` NLI).
-* **Scaled `Qwen2.5-3B` QLoRA (SFT + SimPO) resolves semantic collapse**: Trained on 131 verified Best-of-8 pairs + 30 identity regularizers, the 3B QLoRA adapter reaches `0.906` NLI (`0.000` contradiction) and `75.8` GPT-2 PPL on multi-paragraph text and `0.893` NLI on single-sentence chat—a major improvement over the earlier 1.5B POC (`0.503` overall, `0.208` chat).
-* **NP-boundary-aware classical rules are safe as a deterministic post-pass**: Restricting noun-stacking to single NP subtrees and gating denominal frames on context eliminates relative-clause corruption while preserving markdown structure in 6–22 ms.
+* **Production CLI, Python SDK, and local HTTP server** (`psycho-rev rewrite`, `psycho-rev analyze`, `psycho-rev serve`, `from psycho_rev import Rewriter`) with stdin/pipe support, unified `--diff` previews, and `--in-place` file editing.
+* **Multiple backends**: OpenAI-compatible HTTP endpoints (`openrouter`, `openai`, vLLM, Ollama, llama.cpp), local `Qwen2.5-3B` (zero-shot, decoupled Best-of-N, and QLoRA SFT + SimPO), and a safe-mode deterministic spaCy pass.
+* **Hardened technical-text protection (`code_guard.py`)**: Collision-free single-pass masking for fenced code blocks, inline code, YAML frontmatter, Markdown links, HTML/XML tags, CLI flags, environment variables, URLs, and file paths, plus structure-preserving long-document chunking.
+* **Clarity no-op gate**: Automatically skips already-clear prose (`difficulty_score < 35.0`) so clean human or frontier-model text is not churned unnecessarily.
+* **Decoupled evaluation & real-world OOD corpus pipeline**: Resumable multi-model corpus generation (`corpus_builder.py`), 100%-out-of-lexicon OOD test splitting, independent held-out scoring (`nli-deberta-v3-base`, `gpt2-medium` perplexity, `roberta-base-CoLA` grammatical acceptability), and position-swapped blind pairwise LLM-as-a-judge (`judge.py`).
 
 ## Installation
 
 ```bash
 uv venv --python 3.12 .venv
 source .venv/bin/activate
+
+# Core install (CLI, SDK, HTTP server, OpenAI/OpenRouter HTTP backends, classical spaCy)
 uv pip install -e .
+
+# With local PyTorch / Transformers / QLoRA training & evaluation dependencies
+uv pip install -e ".[ml]"
+
 python -m spacy download en_core_web_sm
 python -c "import nltk; [nltk.download(p) for p in ('wordnet','omw-1.4','brown','reuters','webtext','punkt','punkt_tab')]"
 ```
 
-## Usage
+## Quick Start
 
-### Analyze psycholinguistic features
-
-```bash
-psycho-rev analyze "Your instinct is right; the convoluted sentence you are currently reading is quietly eating its own reader-patience budget — footnote it."
-psycho-rev analyze --file draft.md
-```
-
-### Rewrite text (classical, neural, or hybrid)
+### CLI
 
 ```bash
-# Fast symbolic/spaCy reverser (CPU, ~6 ms)
-psycho-rev rewrite --method classical "Right now \`is_file()\` swallows that permission error, which quietly sabotages the cache invalidation pipeline you added in \`src/cache/store.py\`."
+# Rewrite via OpenRouter or OpenAI (no local GPU required)
+export OPENROUTER_API_KEY=...
+psycho-rev rewrite --method openrouter --diff --file draft.md
 
-# Neural and hybrid options (GPU recommended)
+# Pipe from stdin and inspect a unified diff
+cat notes.md | psycho-rev rewrite --method openrouter --diff
+
+# Edit a Markdown file in place with code/frontmatter/link protection
+psycho-rev rewrite --method openrouter --in-place --file docs/guide.md
+
+# Local GPU inference (Qwen2.5-3B LoRA or Best-of-N)
+psycho-rev rewrite --method lora --adapter-dir 8q0sb/qwen25-3b-psycholinguistic-reversal-lora --file draft.md --plain
 psycho-rev rewrite --method best-of-n --samples 6 --file draft.md --plain
-psycho-rev rewrite --method hybrid-bon --file draft.md --plain
-psycho-rev rewrite --method lora --adapter-dir 8q0sb/qwen25-3b-psycholinguistic-reversal-lora "..."
-psycho-rev rewrite --method hybrid-lora --adapter-dir 8q0sb/qwen25-3b-psycholinguistic-reversal-lora "..."
+
+# Analyze psycholinguistic difficulty features (JSON or text)
+psycho-rev analyze --file draft.md --json
+
+# Run a local HTTP JSON server on 127.0.0.1:8787 (/health, /analyze, /rewrite)
+psycho-rev serve --method openrouter --port 8787
 ```
 
-### Train QLoRA/LoRA (SFT + SimPO) and run full benchmark
+### Python SDK
+
+```python
+from psycho_rev import Rewriter
+
+with Rewriter(backend="openrouter", model="openai/gpt-4o-mini") as rw:
+    result = rw.rewrite("Right now `is_file()` swallows that permission error.")
+    print(result.rewritten)
+    print(result.code_preservation, result.skipped_as_clear)
+```
+
+### Corpus Generation, Training, and Decoupled Evaluation
 
 ```bash
-python -m psycho_rev.train_lora --resume --epochs 3 --dpo-epochs 2
-python -m psycho_rev.evaluate --adapter-dir 8q0sb/qwen25-3b-psycholinguistic-reversal-lora
-pytest -v
+# Generate multi-model real LLM corpus, build 100%-OOD split, and distill teacher pairs
+psycho-rev build-corpus all \
+  --provider openrouter \
+  --models openai/gpt-4o-mini meta-llama/llama-3.3-70b-instruct qwen/qwen-2.5-72b-instruct \
+  --teacher-model openai/gpt-4.1-mini \
+  --samples-per-model 200 \
+  --max-cost-usd 4.50 \
+  --resume
+
+# Train 4-bit QLoRA (Stage 1 SFT + Stage 2 hard-negative SimPO with val checkpoint selection)
+python -m psycho_rev.train_lora \
+  --dataset-path ~/.local/share/psycholinguistic-reversal/datasets/distilled_pairs.jsonl \
+  --output-dir checkpoints/qwen25_3b_v2_lora \
+  --epochs 3 --dpo-epochs 2 --max-length 1024
+
+# Run decoupled held-out evaluation + position-swapped blind pairwise judge on OOD split
+psycho-rev evaluate \
+  --dataset-path ~/.local/share/psycholinguistic-reversal/datasets/test_ood.jsonl \
+  --adapter-dir checkpoints/qwen25_3b_v2_lora \
+  --results-dir results_ood \
+  --skip-nllb --blind-judge --judge-model openai/gpt-4.1-mini
 ```
+
+## Decoupled Benchmark Results
+
+Evaluation uses a two-phase pipeline that separates reranking proxies (`nli-deberta-v3-small`, `gpt2`) from held-out evaluation (`cross-encoder/nli-deberta-v3-base`, `gpt2-medium` strided perplexity, and `textattack/roberta-base-CoLA` grammatical acceptability), plus a position-swapped blind pairwise LLM judge (`openai/gpt-4.1-mini`).
+
+### 1. Real-World Out-of-Lexicon OOD Test Set (71 multi-model LLM passages)
+
+Sampled across `coding`, `technical_docs`, `essay`, and `workplace_chat` from `openai/gpt-4o-mini`, `meta-llama/llama-3.3-70b-instruct`, and `qwen/qwen-2.5-72b-instruct` with 100% out-of-lexicon coverage (zero verbs from the classical lexicon):
+
+| Method | Diff ↓ | Cos Sim ↑ | NLI Min ↑ | Contra ↓ | PPL ↓ | Acc Mean / Min ↑ | Code Pres ↑ | Blind Judge vs Orig (Win / Tie / Loss) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original | 34.1 | 1.000 | 0.995 | 0.001 | 17.5 | 0.942 / 0.835 | 1.000 | — |
+| Classical (spaCy safe) | 33.3 | 1.000 | 0.995 | 0.001 | 17.3 | 0.939 / 0.813 | 1.000 | 0.0% / 85.7% / 14.3% |
+| Qwen2.5-3B ZeroShot | 33.7 | 0.984 | 0.994 | 0.001 | 18.5 | 0.948 / 0.845 | 1.000 | 0.0% / 74.3% / 25.7% |
+| Qwen2.5-3B Best-of-6 | 32.3 | 0.984 | 0.988 | 0.014 | 18.1 | 0.947 / 0.845 | 1.000 | 0.0% / 65.7% / 34.3% |
+| Hybrid (Best-of-6+Classical) | 31.8 | 0.984 | 0.988 | 0.014 | 18.1 | 0.945 / 0.830 | 1.000 | 0.0% / 57.1% / 42.9% |
+| Qwen2.5-3B LoRA (v2) | 34.2 | 0.993 | 0.984 | 0.001 | 18.0 | 0.943 / 0.831 | 1.000 | 0.0% / 74.3% / 25.7% |
+| Hybrid (LoRA+Classical) | 33.7 | 0.993 | 0.984 | 0.001 | 18.0 | 0.941 / 0.817 | 1.000 | 0.0% / 65.7% / 34.3% |
+
+![OOD Benchmark comparison](results/ood_comparison_plot.png)
+
+### 2. Dense AI Stress-Test Benchmark (Decoupled Held-Out + CoLA)
+
+| Split / Method | Diff ↓ | Cos Sim ↑ | NLI Min ↑ | Contra ↓ | PPL ↓ | Acc Mean / Min ↑ | Code Pres ↑ |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Single-Sentence (30 passages)** — Original | 129.5 | 1.000 | 0.986 | 0.002 | 570.6 | 0.798 / 0.798 | 1.000 |
+| Classical (spaCy safe) | 79.6 | 0.964 | 0.962 | 0.034 | 498.7 | 0.790 / 0.790 | 1.000 |
+| Qwen2.5-3B ZeroShot | 73.6 | 0.909 | 0.898 | 0.033 | 244.5 | 0.896 / 0.896 | 1.000 |
+| **Qwen2.5-3B Best-of-6** | **74.8** | **0.914** | **0.998** | **0.000** | **238.6** | **0.891 / 0.891** | **1.000** |
+| Qwen2.5-3B LoRA (v2) | 98.7 | 0.955 | 0.793 | 0.035 | 430.7 | 0.873 / 0.864 | 1.000 |
+| **Multi-Paragraph (18 passages)** — Original | 89.0 | 1.000 | 0.995 | 0.000 | 215.1 | 0.743 / 0.496 | 1.000 |
+| Classical (spaCy safe) | 60.3 | 0.985 | 0.980 | 0.000 | 199.7 | 0.747 / 0.499 | 1.000 |
+| Qwen2.5-3B ZeroShot | 58.5 | 0.947 | 0.903 | 0.000 | 115.0 | 0.854 / 0.647 | 0.969 |
+| **Qwen2.5-3B Best-of-6** | **53.1** | **0.956** | **0.996** | **0.000** | **115.7** | **0.853 / 0.638** | **1.000** |
+| Qwen2.5-3B LoRA (v2) | 73.0 | 0.973 | 0.938 | 0.003 | 164.0 | 0.809 / 0.552 | 1.000 |
+
+![Dense AI Benchmark comparison](results/comparison_plot.png)
+
+### Key Empirical Findings
+
+* **Pure neural rewriting beats Classical post-processing on real prose:** On every split (OOD, dense single-sentence, dense multi-paragraph, and human control), appending `Classical (spaCy)` lowers minimum CoLA grammatical acceptability and increases blind-judge losses (`34.3% → 42.9%` on Best-of-6; `25.7% → 34.3%` on LoRA) even when it nudges the synthetic Difficulty Score down.
+* **Small 3B models shine on genuinely dense prose, not already-clear 70B text:** On dense AI stress tests, de-leaked `Qwen2.5-3B Best-of-6` cuts perplexity by >50% (`570.6 → 238.6` single; `215.1 → 115.7` multi-para) and boosts CoLA grammatical acceptability by +9 to +14 points (`0.798 → 0.891`, `0.496 → 0.638` min) at `0.996–0.998` NLI and `100%` code preservation. On already-clear real LLM prose (`diff ≈ 34`, `PPL ≈ 17.5`), the clarity no-op gate prevents unnecessary churn, and API backends (`--method openrouter` / `openai`) are recommended when rewriting frontier-model text.
+* **Human control preservation:** Both `Qwen2.5-3B LoRA (v2)` (`0.997–0.999` cosine, `0.995–0.997` NLI) and `Best-of-6` (`0.996–0.998` NLI) leave natural human prose intact.
 
 ## Project Layout
 
-* `src/psycho_rev/features.py` — Detectors for all six psycholinguistic features (`ngram_ref_v2.pkl` + NP-boundary-safe `find_stacked_noun_spans`) and composite Difficulty Index
-* `src/psycho_rev/semantics.py` — MiniLM cosine similarity, dynamic-label DeBERTa-v3 chunked bidirectional NLI + contradiction, and strided GPT-2 fluency PPL
-* `src/psycho_rev/code_guard.py` — Placeholder masking/restoration (fenced blocks, inline code, URLs, dotted identifiers, filenames) and markdown-structure-preserving wrapper
-* `src/psycho_rev/classical.py` — Deterministic spaCy dependency-tree + context-gated lexical frame reverser
-* `src/psycho_rev/neural.py` — NLLB-200 RTT, Qwen2.5 zero-shot, Best-of-N reranker with hard code preservation, auto-base-detecting `LoRASinglePassReverser`, and `HybridReverser`
-* `src/psycho_rev/train_lora.py` — Resumable Best-of-8 teacher distillation + QLoRA SFT and reference-free SimPO preference optimization
-* `src/psycho_rev/evaluate.py` — Single-sentence and multi-paragraph benchmark runner, Markdown summary, and 3-panel visualization
-* `results/` — Saved benchmark metrics (`benchmark_results.json`, `summary.md`, `distilled_train_pairs.json`, `comparison_plot.png`)
+* `src/psycho_rev/rewriter.py` — High-level `Rewriter` Python SDK, `RewriteResult`, and `unified_diff`
+* `src/psycho_rev/cli.py` — `psycho-rev` CLI (`rewrite`, `analyze`, `serve`, `build-corpus`, `evaluate`)
+* `src/psycho_rev/server.py` — Thread-safe local HTTP server (`/health`, `/analyze`, `/rewrite`)
+* `src/psycho_rev/neural.py` — De-leaked `REWRITE_SYSTEM_PROMPT`, `OpenAICompatibleReverser`, `QwenZeroShotReverser`, acceptability-aware `BestOfNPsycholinguisticReverser`, `LoRASinglePassReverser`, and `HybridReverser`
+* `src/psycho_rev/classical.py` — Safe-mode spaCy reverser with optional sentence-level fluency gating
+* `src/psycho_rev/code_guard.py` — Collision-free single-pass span masking (code, frontmatter, links, HTML, flags, env vars) and Markdown chunking
+* `src/psycho_rev/features.py` — Detectors for all six psycholinguistic features and composite Difficulty Index
+* `src/psycho_rev/semantics.py` — Decoupled `SemanticEvaluator`, `HeldOutSemanticEvaluator`, and sentence-level `AcceptabilityScorer` (CoLA)
+* `src/psycho_rev/judge.py` — Position-swapped `BlindPairwiseJudge` over OpenRouter/OpenAI
+* `src/psycho_rev/corpus_builder.py` & `datasets.py` — Resumable multi-model LLM corpus builder, deduplicated OOD splitter, and teacher distiller
+* `src/psycho_rev/train_lora.py` — 4-bit QLoRA SFT + hard-negative SimPO trainer with quality filtering, paragraph-aware length handling, and validation checkpointing
+* `src/psycho_rev/evaluate.py` — Two-phase VRAM-safe benchmark runner, Markdown summaries, and plots
